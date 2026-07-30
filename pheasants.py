@@ -8,7 +8,7 @@ import soundfile as sf
 import numpy as np
 from scipy.signal import butter, filtfilt, correlate
 from scipy.fft import fft, ifft
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt # import for optional plotting of GCC-PHAT results
 
 
 # Folders Recorder 1 - 1004 to 1704 to Recorder 5 - 1004 to 1704 wav files
