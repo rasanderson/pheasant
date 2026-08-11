@@ -1,13 +1,12 @@
 # Detect pheasants from left and right channels
 
-from birdnetlib import Recording
+import numpy as np
+import soundfile as sf
 from birdnetlib import RecordingBuffer
 from birdnetlib.analyzer import Analyzer
-from datetime import datetime
-import soundfile as sf
-import numpy as np
-from scipy.signal import butter, filtfilt, correlate
 from scipy.fft import fft, ifft
+from scipy.signal import butter, filtfilt
+
 # import matplotlib.pyplot as plt # import for optional plotting of GCC-PHAT results
 
 
