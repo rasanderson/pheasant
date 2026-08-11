@@ -92,6 +92,8 @@ def gcc_phat(sig, refsig, fs, max_tau=None, interp=16):
 
 def load_info_rows(info_path):
 
+    # Each recorder folder has a CSV-style info.txt that lists the wav files
+    # and their associated metadata. Use it as the source of truth for batch processing.
     with info_path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         return list(reader)
@@ -101,6 +103,8 @@ def process_wav_file(wav_path, analyzer, metadata=None):
 
     metadata = metadata or {}
 
+    # Read the stereo wav once, then split the channels so BirdNET can analyze
+    # each microphone independently before we compare the detections.
     try:
         data, samplerate = sf.read(wav_path)
     except Exception as exc:
@@ -150,6 +154,8 @@ def process_wav_file(wav_path, analyzer, metadata=None):
 
     for (start_time, end_time), detected_by in sorted(all_windows.items()):
 
+        # Save only detections that appear in both channels; those are the
+        # ones we can trust for a left/right time-delay estimate.
         if not {"left", "right"}.issubset(detected_by):
             continue
 
@@ -236,6 +242,7 @@ def process_wav_file(wav_path, analyzer, metadata=None):
 
 def process_recorder_folder(folder_path, analyzer):
 
+    # Treat each recorder directory as a self-contained batch unit.
     info_path = folder_path / "info.txt"
     if not info_path.exists():
         print(f"Skipping {folder_path}: missing info.txt")
@@ -264,6 +271,8 @@ def process_recorder_folder(folder_path, analyzer):
 
 def write_results(results, output_path):
 
+    # Write one combined CSV so downstream review can filter by recorder, time,
+    # or metadata without having to merge per-folder outputs later.
     if not results:
         print("No detections found; nothing to write.")
         return
