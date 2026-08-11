@@ -150,6 +150,9 @@ def process_wav_file(wav_path, analyzer, metadata=None):
 
     for (start_time, end_time), detected_by in sorted(all_windows.items()):
 
+        if not {"left", "right"}.issubset(detected_by):
+            continue
+
         # Extract BirdNET's 3-second window from BOTH channels
         s0 = int(start_time * samplerate)
         s1 = int(end_time * samplerate)
