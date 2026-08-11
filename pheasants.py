@@ -11,8 +11,8 @@ from scipy.fft import fft, ifft
 from scipy.signal import butter, filtfilt
 
 
-BASE_DIR = Path("subset_test")
-OUTPUT_FILE = Path("pheasant_results.csv")
+BASE_DIR = Path("/media/nras/6534-3539")
+OUTPUT_FILE = Path("pheasant_results_sd1.csv")
 
 # Info files are CSV files with meta data about recordings. Header row is:
 # DATE,TIME,LON,LAT,BAT,TEMP,HUMI,FILE,GAIN,SAMPLE RATE,CHANNEL,NOTE
@@ -328,8 +328,11 @@ def main():
     analyzer = Analyzer(custom_species_list_path=custom_species, version="2.4")
 
     recorder_dirs = sorted(
-        folder for folder in BASE_DIR.glob("Recorder * - 1004 to 1704")
+        folder
+        for folder in BASE_DIR.iterdir()
         if folder.is_dir()
+        and folder.name != "System Volume Information"
+        and folder.name.startswith("Recorder")
     )
 
     if not recorder_dirs:
