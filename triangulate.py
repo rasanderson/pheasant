@@ -83,6 +83,10 @@ HTML_MAP_MARGIN_PX = 30
 STATIC_MAP_MARGIN_FRACTION = 0.25
 STATIC_MAP_MAX_ZOOM = 18
 STATIC_MAP_MIN_ZOOM = 3
+MAP_BEARING_HALF_LENGTH_DEFAULT_M = 100.0
+MAP_BEARING_HALF_LENGTH_MIN_M = 100.0
+MAP_BEARING_HALF_LENGTH_MAX_M = 750.0
+MAP_BEARING_LENGTH_STEP_M = 25.0
 
 OSM_TILE_SOURCE = {
     "name": "OpenStreetMap",
@@ -149,14 +153,13 @@ def _site_map_records(sites: pd.DataFrame) -> list[dict[str, float | int | str]]
 
 
 def _bearing_line_records(detections: pd.DataFrame) -> list[dict[str, float | int]]:
-    """Convert detection rows into centered 200 m bearing line segments."""
+    """Convert detection rows into bearing records centered on each recorder."""
 
     if detections.empty:
         return []
 
     to_wgs84 = Transformer.from_crs("EPSG:27700", "EPSG:4326", always_xy=True)
     records = []
-    segment_half_length_m = 100.0
     sort_columns = ["site_id"]
     if "corrected_event_time" in detections.columns:
         sort_columns.append("corrected_event_time")
@@ -169,16 +172,7 @@ def _bearing_line_records(detections: pd.DataFrame) -> list[dict[str, float | in
         bearing_values = [float(row.bearing_1_deg), float(row.bearing_2_deg)]
 
         for branch_index, bearing_deg in enumerate(bearing_values, start=1):
-            radians = math.radians(bearing_deg)
-            dx = math.sin(radians)
-            dy = math.cos(radians)
-
-            x1 = site_x - segment_half_length_m * dx
-            y1 = site_y - segment_half_length_m * dy
-            x2 = site_x + segment_half_length_m * dx
-            y2 = site_y + segment_half_length_m * dy
-            lon1, lat1 = to_wgs84.transform(x1, y1)
-            lon2, lat2 = to_wgs84.transform(x2, y2)
+            lon, lat = to_wgs84.transform(site_x, site_y)
 
             records.append(
                 {
@@ -186,10 +180,8 @@ def _bearing_line_records(detections: pd.DataFrame) -> list[dict[str, float | in
                     "site_id": int(row.site_id),
                     "branch_index": branch_index,
                     "bearing_deg": bearing_deg,
-                    "lon1": float(lon1),
-                    "lat1": float(lat1),
-                    "lon2": float(lon2),
-                    "lat2": float(lat2),
+                    "center_lon": float(lon),
+                    "center_lat": float(lat),
                 }
             )
 
@@ -291,6 +283,28 @@ def write_interactive_site_map(sites: pd.DataFrame, detections: pd.DataFrame, ou
     html, body {{ height: 100%; margin: 0; }}
     #map {{ width: 100%; height: 100%; }}
     body {{ font-family: system-ui, sans-serif; }}
+        .bearing-length-control {{
+            background: rgba(255, 255, 255, 0.95);
+            padding: 10px 12px;
+            border-radius: 8px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.2);
+            min-width: 220px;
+            color: #1f2937;
+        }}
+        .bearing-length-control label {{
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }}
+        .bearing-length-control input[type=range] {{
+            width: 100%;
+            margin: 6px 0 4px;
+        }}
+        .bearing-length-readout {{
+            font-size: 12px;
+            line-height: 1.3;
+        }}
     .site-tooltip {{
       background: rgba(20, 20, 20, 0.88);
       color: white;
@@ -323,17 +337,61 @@ def write_interactive_site_map(sites: pd.DataFrame, detections: pd.DataFrame, ou
     const markers = L.layerGroup();
         const bearingLines = L.layerGroup();
 
-        bearings.forEach((segment) => {{
-            L.polyline(
-                [[segment.lat1, segment.lon1], [segment.lat2, segment.lon2]],
-                {{
-                    color: '#2b6cb0',
-                    weight: 2,
-                    opacity: 0.55,
-                    lineCap: 'round',
-                }}
-            ).addTo(bearingLines);
-        }});
+        function destinationPoint(lat, lon, bearingDeg, distanceM) {{
+            const earthRadiusM = 6378137.0;
+            const bearingRad = bearingDeg * Math.PI / 180.0;
+            const latRad = lat * Math.PI / 180.0;
+            const lonRad = lon * Math.PI / 180.0;
+            const angularDistance = distanceM / earthRadiusM;
+
+            const sinLat = Math.sin(latRad);
+            const cosLat = Math.cos(latRad);
+            const sinAngular = Math.sin(angularDistance);
+            const cosAngular = Math.cos(angularDistance);
+
+            const lat2 = Math.asin(
+                sinLat * cosAngular + cosLat * sinAngular * Math.cos(bearingRad)
+            );
+            const lon2 = lonRad + Math.atan2(
+                Math.sin(bearingRad) * sinAngular * cosLat,
+                cosAngular - sinLat * Math.sin(lat2)
+            );
+
+            return [
+                lat2 * 180.0 / Math.PI,
+                ((lon2 * 180.0 / Math.PI + 540.0) % 360.0) - 180.0,
+            ];
+        }}
+
+        function rebuildBearingLines(halfLengthM) {{
+            bearingLines.clearLayers();
+            bearings.forEach((segment) => {{
+                const startPoint = destinationPoint(
+                    segment.center_lat,
+                    segment.center_lon,
+                    segment.bearing_deg + 180.0,
+                    halfLengthM
+                );
+                const endPoint = destinationPoint(
+                    segment.center_lat,
+                    segment.center_lon,
+                    segment.bearing_deg,
+                    halfLengthM
+                );
+
+                L.polyline(
+                    [startPoint, endPoint],
+                    {{
+                        color: '#2b6cb0',
+                        weight: 2,
+                        opacity: 0.55,
+                        lineCap: 'round',
+                    }}
+                ).addTo(bearingLines);
+            }});
+        }}
+
+        rebuildBearingLines({MAP_BEARING_HALF_LENGTH_DEFAULT_M});
 
     sites.forEach((site) => {{
       L.circleMarker([site.lat, site.lon], {{
@@ -354,6 +412,40 @@ def write_interactive_site_map(sites: pd.DataFrame, detections: pd.DataFrame, ou
             {{ 'Recorder locations': markers, 'Bearing lines': bearingLines }},
             {{ collapsed: false }}
         ).addTo(map);
+
+        const bearingLengthControl = L.control({{ position: 'topright' }});
+        bearingLengthControl.onAdd = function () {{
+            const div = L.DomUtil.create('div', 'bearing-length-control leaflet-bar');
+            div.innerHTML = `
+                <label for="bearing-length-slider">Bearing line length</label>
+                <input
+                    id="bearing-length-slider"
+                    type="range"
+                    min="{MAP_BEARING_HALF_LENGTH_MIN_M}"
+                    max="{MAP_BEARING_HALF_LENGTH_MAX_M}"
+                    step="{MAP_BEARING_LENGTH_STEP_M}"
+                    value="{MAP_BEARING_HALF_LENGTH_DEFAULT_M}"
+                />
+                <div id="bearing-length-readout" class="bearing-length-readout">
+                    100 m each side / 200 m total
+                </div>
+            `;
+            L.DomEvent.disableClickPropagation(div);
+            L.DomEvent.disableScrollPropagation(div);
+            return div;
+        }};
+        bearingLengthControl.addTo(map);
+
+        const bearingLengthSlider = document.getElementById('bearing-length-slider');
+        const bearingLengthReadout = document.getElementById('bearing-length-readout');
+        const updateBearingLength = () => {{
+            const halfLengthM = Number(bearingLengthSlider.value);
+            rebuildBearingLines(halfLengthM);
+            bearingLengthReadout.textContent = `${{halfLengthM}} m each side / ${{halfLengthM * 2}} m total`;
+        }};
+        bearingLengthSlider.addEventListener('input', updateBearingLength);
+        updateBearingLength();
+
     map.fitBounds([[{lat_min}, {lon_min}], [{lat_max}, {lon_max}]], {{ padding: [{HTML_MAP_MARGIN_PX}, {HTML_MAP_MARGIN_PX}] }});
   </script>
 </body>
