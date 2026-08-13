@@ -11,8 +11,8 @@ from scipy.fft import fft, ifft
 from scipy.signal import butter, filtfilt
 
 
-BASE_DIR = Path("/media/nras/6534-3539")
-OUTPUT_FILE = Path("pheasant_results_sd1.csv")
+BASE_DIR = Path("/media/nras/5612-B67A")
+OUTPUT_FILE = Path("pheasant_results_sd3.csv")
 
 # Info files are CSV files with meta data about recordings. Header row is:
 # DATE,TIME,LON,LAT,BAT,TEMP,HUMI,FILE,GAIN,SAMPLE RATE,CHANNEL,NOTE
