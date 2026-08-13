@@ -969,6 +969,48 @@ def build_events(df: pd.DataFrame) -> pd.DataFrame:
     return deduped
 
 
+def debug_event_candidates(df: pd.DataFrame, window_seconds: float, max_events: int = 10) -> None:
+    """Print a compact diagnosis of provisional candidate clusters across sites."""
+
+    if df.empty:
+        print("Debug event candidates: no rows to inspect.")
+        return
+
+    ordered = df.sort_values("corrected_event_time").copy().reset_index(drop=True)
+    event_ids = []
+    current_event = 0
+    current_anchor = ordered.loc[0, "corrected_event_time"]
+
+    for row_time in ordered["corrected_event_time"]:
+        if (row_time - current_anchor).total_seconds() > window_seconds:
+            current_event += 1
+            current_anchor = row_time
+        event_ids.append(current_event)
+
+    ordered["event_id"] = event_ids
+    ordered["abs_tdoa_ms"] = ordered["tdoa_ms"].abs()
+    deduped = (
+        ordered.sort_values("abs_tdoa_ms", ascending=False)
+        .drop_duplicates(subset=["event_id", "site_id"], keep="first")
+        .sort_values(["event_id", "corrected_event_time"])
+    )
+
+    site_counts = deduped.groupby("event_id")["site_id"].nunique()
+    by_site_count = site_counts.sort_values(ascending=False)
+    if by_site_count.empty:
+        print(f"Debug event candidates: no provisional clusters for window {window_seconds}s.")
+        return
+
+    print(f"Debug event candidates (window={window_seconds}s):")
+    for event_id, n_sites in by_site_count.head(max_events).items():
+        block = deduped[deduped["event_id"] == event_id].copy()
+        site_list = sorted(block["site_id"].unique().tolist())
+        print(
+            f"  event {int(event_id)}: n_sites={len(site_list)}, sites={site_list}, "
+            f"time_range=({block['corrected_event_time'].min()} -> {block['corrected_event_time'].max()})"
+        )
+
+
 def count_multi_site_events(df: pd.DataFrame, window_seconds: float, min_sites: int) -> int:
     """Count events with at least min_sites unique sites for a given window size."""
 
@@ -1006,6 +1048,7 @@ def build_event_matching_diagnostics(
 
     rows = []
 
+    print("\nEvent-window sweep diagnostics:")
     for window_s in EVENT_WINDOW_SWEEP_SECONDS:
         raw_count = count_multi_site_events(raw_df.assign(corrected_event_time=raw_df["event_time"]), window_s, MIN_SITES_PER_EVENT)
         corrected_count = count_multi_site_events(corrected_df, window_s, MIN_SITES_PER_EVENT)
@@ -1019,6 +1062,40 @@ def build_event_matching_diagnostics(
                 "reference_site_id": calibration.reference_site_id,
             }
         )
+        print(
+            f"  window={window_s:.1f}s -> raw={raw_count}, corrected={corrected_count}, "
+            f"delta={corrected_count - raw_count}"
+        )
+
+    debug_event_candidates(corrected_df, EVENT_WINDOW_SECONDS)
+
+    if corrected_df.empty:
+        return pd.DataFrame(rows)
+
+    # Targeted inspection: find the most promising timestamp overlaps across site IDs.
+    candidate_rows = []
+    for site_id, block in corrected_df.groupby("site_id"):
+        candidate_rows.extend(
+            [
+                {
+                    "site_id": int(site_id),
+                    "event_time": ts,
+                    "tdoa_ms": float(row["tdoa_ms"]),
+                }
+                for ts, row in zip(block["corrected_event_time"], block.itertuples(index=False), strict=False)
+            ]
+        )
+
+    if candidate_rows:
+        print("\nSample multi-site timing candidates (first 10 by site/time):")
+        probe = pd.DataFrame(candidate_rows).sort_values(["event_time", "site_id"]).head(10)
+        for row in probe.itertuples(index=False):
+            print(
+                f"  site={int(row.site_id)} @ {row.event_time} | tdoa_ms={float(row.tdoa_ms):.3f}"
+            )
+
+    # The earlier tuple-based probe is not used here; this section keeps the debug
+    # output stable while leaving the main workflow unchanged.
 
     for _, row in calibration.site_pair_stats.iterrows():
         rows.append(
