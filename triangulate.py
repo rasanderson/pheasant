@@ -42,10 +42,12 @@ INPUT_FILES = [
 
 # Filtering and grouping parameters.
 TDOA_THRESHOLD_MS = 0.025
-EVENT_WINDOW_SECONDS = 1.5
+# The recorders may not be perfectly time-synced, so allow a wider causal
+# coincidence window for same-call matching across sites.
+EVENT_WINDOW_SECONDS = 180.0
 MIN_SITES_PER_EVENT = 3
-EVENT_WINDOW_SWEEP_SECONDS = [0.5, 0.75, 1.0, 1.5, 2.0, 5.0, 10.0, 15.0]
-MAX_PAIR_DELTA_SECONDS = 45.0
+EVENT_WINDOW_SWEEP_SECONDS = [0.5, 0.75, 1.0, 1.5, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 180.0]
+MAX_PAIR_DELTA_SECONDS = 180.0
 
 # Site clustering parameters in metres.
 TARGET_SITE_COUNT = 6
@@ -1122,14 +1124,14 @@ def build_event_matching_diagnostics(
             f"delta={corrected_count - raw_count}"
         )
 
-    pair_matrix = pairwise_time_alignment_matrix(corrected_df, max_delta_s=5.0)
-    print("\nCross-recorder pair alignment matrix (nearest-neighbor matches within 5s):")
+    pair_matrix = pairwise_time_alignment_matrix(corrected_df, max_delta_s=MAX_PAIR_DELTA_SECONDS)
+    print(f"\nCross-recorder pair alignment matrix (nearest-neighbor matches within {MAX_PAIR_DELTA_SECONDS:.0f}s):")
     if pair_matrix.empty:
-        print("  no recorder pairs have any nearest-neighbor matches within 5s")
+        print(f"  no recorder pairs have any nearest-neighbor matches within {MAX_PAIR_DELTA_SECONDS:.0f}s")
     else:
         print(pair_matrix.to_string(index=False))
 
-    print("\nCandidate pair timestamps (recorder, datetime, delta):")
+    print(f"\nCandidate pair timestamps (recorder, datetime, delta <= {MAX_PAIR_DELTA_SECONDS:.0f}s):")
     pair_candidates = []
     for site_a, site_b in itertools.combinations(sorted(corrected_df["site_id"].unique()), 2):
         a_times = corrected_df.loc[corrected_df["site_id"] == site_a, ["corrected_event_time", "wav_file", "peak_time_s"]].sort_values("corrected_event_time").reset_index(drop=True)
@@ -1145,7 +1147,7 @@ def build_event_matching_diagnostics(
                 if best_delta is None or delta_s < best_delta:
                     best_delta = delta_s
                     best_row_b = row_b
-            if best_delta is not None and best_delta <= 5.0:
+            if best_delta is not None and best_delta <= MAX_PAIR_DELTA_SECONDS:
                 pair_candidates.append(
                     {
                         "site_a": int(site_a),
@@ -1161,7 +1163,7 @@ def build_event_matching_diagnostics(
                 )
 
     if not pair_candidates:
-        print("  no candidate recorder pairs within 5s")
+        print(f"  no candidate recorder pairs within {MAX_PAIR_DELTA_SECONDS:.0f}s")
     else:
         for entry in sorted(pair_candidates, key=lambda x: x["delta_s"])[:20]:
             print(

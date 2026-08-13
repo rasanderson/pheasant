@@ -7,3 +7,6 @@ window_sweep,2.0,0,0,0,1
 window_sweep,5.0,0,0,0,1
 window_sweep,10.0,0,0,0,1
 window_sweep,15.0,0,0,0,1
+window_sweep,30.0,0,0,0,1
+window_sweep,60.0,0,0,0,1
+window_sweep,180.0,0,0,0,1
