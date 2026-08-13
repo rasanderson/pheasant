@@ -42,9 +42,9 @@ INPUT_FILES = [
 
 # Filtering and grouping parameters.
 TDOA_THRESHOLD_MS = 0.025
-EVENT_WINDOW_SECONDS = 0.75
+EVENT_WINDOW_SECONDS = 1.5
 MIN_SITES_PER_EVENT = 3
-EVENT_WINDOW_SWEEP_SECONDS = [0.5, 0.75, 1.0, 2.0, 5.0, 10.0, 15.0]
+EVENT_WINDOW_SWEEP_SECONDS = [0.5, 0.75, 1.0, 1.5, 2.0, 5.0, 10.0, 15.0]
 MAX_PAIR_DELTA_SECONDS = 45.0
 
 # Site clustering parameters in metres.
@@ -58,7 +58,10 @@ MIN_RECORDS_PER_LOCATION = 2
 TDOA_WEIGHT_LOW_MS = TDOA_THRESHOLD_MS
 TDOA_WEIGHT_HIGH_MS = 0.25
 MIN_WEIGHT = 0.05
-ORIENTATION_SIGMA_DEG = 3.0
+# This short-baseline array can show several degrees of bearing drift from
+# orientation and TDOA estimation errors, so the robust solver needs a wider
+# residual scale than the original 3° assumption.
+ORIENTATION_SIGMA_DEG = 20.0
 
 MAX_ACCEPTABLE_RMS_DEG = 18.0
 MIN_GEOMETRY_SCORE = math.sin(math.radians(10.0))
@@ -1228,8 +1231,25 @@ def main() -> None:
 
     combined = load_and_prepare_data(INPUT_FILES)
     combined_with_sites, sites = assign_canonical_sites(combined)
-    calibration = calibrate_site_clock_offsets(combined_with_sites)
-    corrected = apply_site_clock_offsets(combined_with_sites, calibration)
+
+    # GPS-synced recorders are assumed to be time-aligned; disable offset
+    # calibration unless evidence suggests drift between devices.
+    calibration = OffsetCalibration(
+        reference_site_id=int(sorted(combined_with_sites["site_id"].unique())[0]),
+        offsets_s={int(site_id): 0.0 for site_id in sorted(combined_with_sites["site_id"].unique())},
+        site_pair_stats=pd.DataFrame(columns=[
+            "reference_site_id",
+            "other_site_id",
+            "n_matches",
+            "median_delta_s_other_minus_ref",
+            "mad_delta_s",
+            "p10_delta_s",
+            "p90_delta_s",
+            "applied_correction_s",
+        ]),
+    )
+    corrected = combined_with_sites.copy()
+    corrected["corrected_event_time"] = corrected["event_time"].copy()
     diagnostics = build_event_matching_diagnostics(combined_with_sites, corrected, calibration)
     event_members = build_events(corrected)
     solutions = solve_all_events(event_members)
