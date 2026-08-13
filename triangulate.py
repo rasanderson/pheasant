@@ -717,15 +717,17 @@ def load_and_prepare_data(files: Iterable[str]) -> pd.DataFrame:
     combined["lon_deg"] = combined["LON"].map(parse_coordinate)
     combined["lat_deg"] = combined["LAT"].map(parse_coordinate)
 
-    # Build absolute event timestamp from recording start + within-file peak time.
+    # Build a single datetime field from the separate DATE and TIME columns,
+    # then derive the event timestamp from the within-file peak time.
     starts = [
         parse_recording_start(d, t)
         for d, t in zip(combined["DATE"], combined["TIME"], strict=False)
     ]
-    combined["recording_start"] = starts
+    combined["recording_datetime"] = starts
+    combined["recording_start"] = combined["recording_datetime"]
     combined["event_time"] = [
         start + timedelta(seconds=float(offset_s))
-        for start, offset_s in zip(starts, combined["peak_time_s"], strict=False)
+        for start, offset_s in zip(combined["recording_datetime"], combined["peak_time_s"], strict=False)
     ]
 
     # Project WGS84 -> EPSG:27700 for all internal geometry.
@@ -1075,16 +1077,14 @@ def build_event_matching_diagnostics(
     # Targeted inspection: find the most promising timestamp overlaps across site IDs.
     candidate_rows = []
     for site_id, block in corrected_df.groupby("site_id"):
-        candidate_rows.extend(
-            [
+        for ts, row in zip(block["corrected_event_time"], block.itertuples(index=False), strict=False):
+            candidate_rows.append(
                 {
                     "site_id": int(site_id),
                     "event_time": ts,
-                    "tdoa_ms": float(row["tdoa_ms"]),
+                    "tdoa_ms": float(getattr(row, "tdoa_ms")),
                 }
-                for ts, row in zip(block["corrected_event_time"], block.itertuples(index=False), strict=False)
-            ]
-        )
+            )
 
     if candidate_rows:
         print("\nSample multi-site timing candidates (first 10 by site/time):")
