@@ -148,6 +148,54 @@ def _site_map_records(sites: pd.DataFrame) -> list[dict[str, float | int | str]]
     return records
 
 
+def _bearing_line_records(detections: pd.DataFrame) -> list[dict[str, float | int]]:
+    """Convert detection rows into centered 200 m bearing line segments."""
+
+    if detections.empty:
+        return []
+
+    to_wgs84 = Transformer.from_crs("EPSG:27700", "EPSG:4326", always_xy=True)
+    records = []
+    segment_half_length_m = 100.0
+    sort_columns = ["site_id"]
+    if "corrected_event_time" in detections.columns:
+        sort_columns.append("corrected_event_time")
+    elif "event_time" in detections.columns:
+        sort_columns.append("event_time")
+
+    for det_id, row in enumerate(detections.sort_values(sort_columns).itertuples(index=False), start=1):
+        site_x = float(row.canonical_easting_m)
+        site_y = float(row.canonical_northing_m)
+        bearing_values = [float(row.bearing_1_deg), float(row.bearing_2_deg)]
+
+        for branch_index, bearing_deg in enumerate(bearing_values, start=1):
+            radians = math.radians(bearing_deg)
+            dx = math.sin(radians)
+            dy = math.cos(radians)
+
+            x1 = site_x - segment_half_length_m * dx
+            y1 = site_y - segment_half_length_m * dy
+            x2 = site_x + segment_half_length_m * dx
+            y2 = site_y + segment_half_length_m * dy
+            lon1, lat1 = to_wgs84.transform(x1, y1)
+            lon2, lat2 = to_wgs84.transform(x2, y2)
+
+            records.append(
+                {
+                    "det_id": det_id,
+                    "site_id": int(row.site_id),
+                    "branch_index": branch_index,
+                    "bearing_deg": bearing_deg,
+                    "lon1": float(lon1),
+                    "lat1": float(lat1),
+                    "lon2": float(lon2),
+                    "lat2": float(lat2),
+                }
+            )
+
+    return records
+
+
 def _site_bounds(records: list[dict[str, float | int | str]], pad_fraction: float = 0.25) -> tuple[float, float, float, float]:
     """Return lon/lat bounds expanded by a fractional margin."""
 
@@ -219,16 +267,18 @@ def _world_px_to_canvas_px(
     return world_x - canvas_origin_x, world_y - canvas_origin_y
 
 
-def write_interactive_site_map(sites: pd.DataFrame, output_path: Path) -> None:
+def write_interactive_site_map(sites: pd.DataFrame, detections: pd.DataFrame, output_path: Path) -> None:
     """Write a lightweight Leaflet map showing recorder locations."""
 
     records = _site_map_records(sites)
     if not records:
         raise RuntimeError("Cannot write map: no sites provided.")
 
+    bearing_records = _bearing_line_records(detections)
     bounds = _site_bounds(records)
     lon_min, lat_min, lon_max, lat_max = bounds
     site_json = json.dumps(records, indent=2)
+    bearing_json = json.dumps(bearing_records, indent=2)
 
     html = f"""<!doctype html>
 <html lang=\"en\">
@@ -256,6 +306,7 @@ def write_interactive_site_map(sites: pd.DataFrame, output_path: Path) -> None:
   <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
   <script>
     const sites = {site_json};
+        const bearings = {bearing_json};
     const map = L.map('map', {{ scrollWheelZoom: true }});
 
     const osm = L.tileLayer('{OSM_TILE_SOURCE['url']}', {{
@@ -270,6 +321,20 @@ def write_interactive_site_map(sites: pd.DataFrame, output_path: Path) -> None:
     osm.addTo(map);
 
     const markers = L.layerGroup();
+        const bearingLines = L.layerGroup();
+
+        bearings.forEach((segment) => {{
+            L.polyline(
+                [[segment.lat1, segment.lon1], [segment.lat2, segment.lon2]],
+                {{
+                    color: '#2b6cb0',
+                    weight: 2,
+                    opacity: 0.55,
+                    lineCap: 'round',
+                }}
+            ).addTo(bearingLines);
+        }});
+
     sites.forEach((site) => {{
       L.circleMarker([site.lat, site.lon], {{
         radius: 8,
@@ -284,7 +349,11 @@ def write_interactive_site_map(sites: pd.DataFrame, output_path: Path) -> None:
     }});
 
     markers.addTo(map);
-    L.control.layers({{ 'OpenStreetMap': osm, 'Satellite': satellite }}, {{ 'Recorder locations': markers }}, {{ collapsed: false }}).addTo(map);
+        L.control.layers(
+            {{ 'OpenStreetMap': osm, 'Satellite': satellite }},
+            {{ 'Recorder locations': markers, 'Bearing lines': bearingLines }},
+            {{ collapsed: false }}
+        ).addTo(map);
     map.fitBounds([[{lat_min}, {lon_min}], [{lat_max}, {lon_max}]], {{ padding: [{HTML_MAP_MARGIN_PX}, {HTML_MAP_MARGIN_PX}] }});
   </script>
 </body>
@@ -1078,7 +1147,7 @@ def main() -> None:
     diagnostics.to_csv(root / EVENT_DIAGNOSTICS_OUTPUT, index=False)
     event_members.to_csv(root / EVENT_MEMBERS_OUTPUT, index=False)
     solutions.to_csv(root / SOLUTIONS_OUTPUT, index=False)
-    write_interactive_site_map(sites, root / MAP_HTML_OUTPUT)
+    write_interactive_site_map(sites, combined_with_sites, root / MAP_HTML_OUTPUT)
     write_static_site_map(sites, root / MAP_PNG_OUTPUT)
 
     print(f"Wrote canonical sites to {SITES_OUTPUT} ({len(sites)} rows)")
