@@ -14,17 +14,22 @@ All geometric calculations are done in EPSG:27700 for metric stability.
 
 from __future__ import annotations
 
+import io
 import itertools
+import json
 import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
 from pyproj import Transformer
 from scipy.optimize import least_squares
 
@@ -65,6 +70,30 @@ EVENT_MEMBERS_OUTPUT = "triangulation_event_members.csv"
 SOLUTIONS_OUTPUT = "triangulated_calls.csv"
 EVENT_DIAGNOSTICS_OUTPUT = "event_matching_diagnostics.csv"
 PAIRWISE_OFFSET_OUTPUT = "site_pair_offset_estimates.csv"
+MAP_HTML_OUTPUT = "triangulation_sites_map.html"
+MAP_PNG_OUTPUT = "triangulation_sites_map.png"
+
+# Map rendering parameters.
+MAP_TILE_SIZE = 256
+MAP_STATIC_WIDTH = 1400
+MAP_STATIC_HEIGHT = 1000
+MAP_LABEL_PREFIX = "Recorder"
+MAP_HTML_TITLE = "Pheasant recorder locations"
+HTML_MAP_MARGIN_PX = 30
+STATIC_MAP_MARGIN_FRACTION = 0.25
+STATIC_MAP_MAX_ZOOM = 18
+STATIC_MAP_MIN_ZOOM = 3
+
+OSM_TILE_SOURCE = {
+    "name": "OpenStreetMap",
+    "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "attribution": "&copy; OpenStreetMap contributors",
+}
+SATELLITE_TILE_SOURCE = {
+    "name": "Esri World Imagery",
+    "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    "attribution": "Tiles &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+}
 
 # Local field time zone used to attach tzinfo to parsed local timestamps.
 FIELD_TIMEZONE = ZoneInfo("Europe/London")
@@ -102,11 +131,243 @@ class OffsetCalibration:
     site_pair_stats: pd.DataFrame
 
 
+def _site_map_records(sites: pd.DataFrame) -> list[dict[str, float | int | str]]:
+    """Convert canonical site rows into map-friendly records."""
+
+    records = []
+    for row in sites.sort_values("site_id").itertuples(index=False):
+        records.append(
+            {
+                "site_id": int(row.site_id),
+                "label": f"{MAP_LABEL_PREFIX} {int(row.site_id)}",
+                "n_detections": int(row.n_detections),
+                "lon": float(row.canonical_lon_deg),
+                "lat": float(row.canonical_lat_deg),
+            }
+        )
+    return records
+
+
+def _site_bounds(records: list[dict[str, float | int | str]], pad_fraction: float = 0.25) -> tuple[float, float, float, float]:
+    """Return lon/lat bounds expanded by a fractional margin."""
+
+    lons = np.array([float(record["lon"]) for record in records], dtype=float)
+    lats = np.array([float(record["lat"]) for record in records], dtype=float)
+
+    lon_min = float(lons.min())
+    lon_max = float(lons.max())
+    lat_min = float(lats.min())
+    lat_max = float(lats.max())
+
+    lon_span = max(lon_max - lon_min, 0.0001)
+    lat_span = max(lat_max - lat_min, 0.0001)
+    lon_pad = lon_span * pad_fraction
+    lat_pad = lat_span * pad_fraction
+
+    return lon_min - lon_pad, lat_min - lat_pad, lon_max + lon_pad, lat_max + lat_pad
+
+
+def _lonlat_to_world_px(lon: float, lat: float, zoom: int) -> tuple[float, float]:
+    """Convert lon/lat to Web Mercator world pixels."""
+
+    lat = max(min(lat, 85.05112878), -85.05112878)
+    world_size = MAP_TILE_SIZE * (2**zoom)
+    x = (lon + 180.0) / 360.0 * world_size
+    sin_lat = math.sin(math.radians(lat))
+    y = (0.5 - math.log((1.0 + sin_lat) / (1.0 - sin_lat)) / (4.0 * math.pi)) * world_size
+    return x, y
+
+
+def _choose_static_zoom(bounds: tuple[float, float, float, float]) -> int:
+    """Choose the highest zoom where the padded bounds fit the output canvas."""
+
+    lon_min, lat_min, lon_max, lat_max = bounds
+    for zoom in range(STATIC_MAP_MAX_ZOOM, STATIC_MAP_MIN_ZOOM - 1, -1):
+        x1, y1 = _lonlat_to_world_px(lon_min, lat_max, zoom)
+        x2, y2 = _lonlat_to_world_px(lon_max, lat_min, zoom)
+        if abs(x2 - x1) <= MAP_STATIC_WIDTH * 0.9 and abs(y2 - y1) <= MAP_STATIC_HEIGHT * 0.9:
+            return zoom
+    return STATIC_MAP_MIN_ZOOM
+
+
+def _tile_provider(style: str) -> dict[str, str]:
+    """Return the tile source configuration for a given backdrop style."""
+
+    if style == "satellite":
+        return SATELLITE_TILE_SOURCE
+    return OSM_TILE_SOURCE
+
+
+def _download_tile(tile_url: str) -> Image.Image:
+    """Fetch a single map tile image."""
+
+    request = Request(tile_url, headers={"User-Agent": "pheasant-triangulation-map/1.0"})
+    with urlopen(request, timeout=20) as response:
+        return Image.open(io.BytesIO(response.read())).convert("RGB")
+
+
+def _world_px_to_canvas_px(
+    lon: float,
+    lat: float,
+    zoom: int,
+    canvas_origin_x: float,
+    canvas_origin_y: float,
+) -> tuple[float, float]:
+    """Project lon/lat into canvas pixel coordinates."""
+
+    world_x, world_y = _lonlat_to_world_px(lon, lat, zoom)
+    return world_x - canvas_origin_x, world_y - canvas_origin_y
+
+
+def write_interactive_site_map(sites: pd.DataFrame, output_path: Path) -> None:
+    """Write a lightweight Leaflet map showing recorder locations."""
+
+    records = _site_map_records(sites)
+    if not records:
+        raise RuntimeError("Cannot write map: no sites provided.")
+
+    bounds = _site_bounds(records)
+    lon_min, lat_min, lon_max, lat_max = bounds
+    site_json = json.dumps(records, indent=2)
+
+    html = f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <title>{MAP_HTML_TITLE}</title>
+  <link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" />
+  <style>
+    html, body {{ height: 100%; margin: 0; }}
+    #map {{ width: 100%; height: 100%; }}
+    body {{ font-family: system-ui, sans-serif; }}
+    .site-tooltip {{
+      background: rgba(20, 20, 20, 0.88);
+      color: white;
+      border: 0;
+      border-radius: 6px;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+      padding: 4px 8px;
+    }}
+  </style>
+</head>
+<body>
+  <div id=\"map\"></div>
+  <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
+  <script>
+    const sites = {site_json};
+    const map = L.map('map', {{ scrollWheelZoom: true }});
+
+    const osm = L.tileLayer('{OSM_TILE_SOURCE['url']}', {{
+      attribution: '{OSM_TILE_SOURCE['attribution']}',
+      maxZoom: 20,
+    }});
+    const satellite = L.tileLayer('{SATELLITE_TILE_SOURCE['url']}', {{
+      attribution: '{SATELLITE_TILE_SOURCE['attribution']}',
+      maxZoom: 20,
+    }});
+
+    osm.addTo(map);
+
+    const markers = L.layerGroup();
+    sites.forEach((site) => {{
+      L.circleMarker([site.lat, site.lon], {{
+        radius: 8,
+        color: '#ffffff',
+        weight: 2,
+        fillColor: '#e44',
+        fillOpacity: 0.95,
+      }})
+        .bindTooltip(site.label, {{ permanent: true, direction: 'top', offset: [0, -8], className: 'site-tooltip' }})
+        .bindPopup(`<strong>${{site.label}}</strong><br/>Detections: ${{site.n_detections}}<br/>Lon: ${{site.lon.toFixed(6)}}<br/>Lat: ${{site.lat.toFixed(6)}}`)
+        .addTo(markers);
+    }});
+
+    markers.addTo(map);
+    L.control.layers({{ 'OpenStreetMap': osm, 'Satellite': satellite }}, {{ 'Recorder locations': markers }}, {{ collapsed: false }}).addTo(map);
+    map.fitBounds([[{lat_min}, {lon_min}], [{lat_max}, {lon_max}]], {{ padding: [{HTML_MAP_MARGIN_PX}, {HTML_MAP_MARGIN_PX}] }});
+  </script>
+</body>
+</html>
+"""
+
+    output_path.write_text(html, encoding="utf-8")
+
+
+def write_static_site_map(sites: pd.DataFrame, output_path: Path, style: str = "osm") -> None:
+    """Write a stitched PNG map using public tile sources."""
+
+    records = _site_map_records(sites)
+    if not records:
+        raise RuntimeError("Cannot write static map: no sites provided.")
+
+    bounds = _site_bounds(records, pad_fraction=STATIC_MAP_MARGIN_FRACTION)
+    zoom = _choose_static_zoom(bounds)
+    lon_min, lat_min, lon_max, lat_max = bounds
+    provider = _tile_provider(style)
+
+    world_x1, world_y1 = _lonlat_to_world_px(lon_min, lat_max, zoom)
+    world_x2, world_y2 = _lonlat_to_world_px(lon_max, lat_min, zoom)
+    tile_x_min = math.floor(min(world_x1, world_x2) / MAP_TILE_SIZE)
+    tile_x_max = math.floor(max(world_x1, world_x2) / MAP_TILE_SIZE)
+    tile_y_min = math.floor(min(world_y1, world_y2) / MAP_TILE_SIZE)
+    tile_y_max = math.floor(max(world_y1, world_y2) / MAP_TILE_SIZE)
+
+    canvas_width = (tile_x_max - tile_x_min + 1) * MAP_TILE_SIZE
+    canvas_height = (tile_y_max - tile_y_min + 1) * MAP_TILE_SIZE
+    canvas = Image.new("RGB", (canvas_width, canvas_height), (243, 241, 234))
+
+    for tile_x in range(tile_x_min, tile_x_max + 1):
+        for tile_y in range(tile_y_min, tile_y_max + 1):
+            tile_url = provider["url"].format(z=zoom, x=tile_x, y=tile_y)
+            try:
+                tile_image = _download_tile(tile_url)
+            except (URLError, OSError, TimeoutError):
+                continue
+
+            canvas.paste(tile_image, ((tile_x - tile_x_min) * MAP_TILE_SIZE, (tile_y - tile_y_min) * MAP_TILE_SIZE))
+
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+    canvas_origin_x = tile_x_min * MAP_TILE_SIZE
+    canvas_origin_y = tile_y_min * MAP_TILE_SIZE
+
+    for record in records:
+        px, py = _world_px_to_canvas_px(float(record["lon"]), float(record["lat"]), zoom, canvas_origin_x, canvas_origin_y)
+        x = round(px)
+        y = round(py)
+        draw.ellipse([x - 8, y - 8, x + 8, y + 8], fill=(220, 68, 62), outline=(255, 255, 255), width=3)
+
+        text = f"{record['label']} ({record['n_detections']})"
+        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = text_bbox[2] - text_bbox[0]
+        text_h = text_bbox[3] - text_bbox[1]
+        pad = 4
+        tx = min(max(10, x + 12), canvas.width - text_w - 2 * pad - 10)
+        ty = min(max(10, y - text_h - 2 * pad - 12), canvas.height - text_h - 2 * pad - 10)
+        draw.rounded_rectangle([tx, ty, tx + text_w + 2 * pad, ty + text_h + 2 * pad], radius=4, fill=(25, 25, 25))
+        draw.text((tx + pad, ty + pad), text, fill=(255, 255, 255), font=font)
+
+    caption = f"{provider['name']} backdrop | zoom {zoom} | {len(records)} recorder locations"
+    caption_bbox = draw.textbbox((0, 0), caption, font=font)
+    caption_w = caption_bbox[2] - caption_bbox[0]
+    caption_h = caption_bbox[3] - caption_bbox[1]
+    draw.rounded_rectangle(
+        [10, canvas.height - caption_h - 18, 20 + caption_w + 8, canvas.height - 8],
+        radius=4,
+        fill=(25, 25, 25),
+    )
+    draw.text((14, canvas.height - caption_h - 14), caption, fill=(255, 255, 255), font=font)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+
+
 def extract_recorder_number(recorder_folder: str) -> int:
     """Extract recorder number from values like 'Recorder 3 - 1004 to 1704'."""
 
     if not isinstance(recorder_folder, str):
-        raise ValueError(f"Invalid recorder_folder value: {recorder_folder!r}")
+        raise TypeError(f"Invalid recorder_folder value: {recorder_folder!r}")
 
     match = re.search(r"Recorder\s+(\d+)", recorder_folder)
     if not match:
@@ -459,7 +720,7 @@ def assign_canonical_sites(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
         site_rows.append(
             {
                 "site_id": int(site_id),
-                "n_detections": int(len(block)),
+                "n_detections": len(block),
                 "n_unique_locations": int(block[["LON", "LAT"]].drop_duplicates().shape[0]),
                 "canonical_easting_m": float(block["easting_m"].median()),
                 "canonical_northing_m": float(block["northing_m"].median()),
@@ -817,6 +1078,8 @@ def main() -> None:
     diagnostics.to_csv(root / EVENT_DIAGNOSTICS_OUTPUT, index=False)
     event_members.to_csv(root / EVENT_MEMBERS_OUTPUT, index=False)
     solutions.to_csv(root / SOLUTIONS_OUTPUT, index=False)
+    write_interactive_site_map(sites, root / MAP_HTML_OUTPUT)
+    write_static_site_map(sites, root / MAP_PNG_OUTPUT)
 
     print(f"Wrote canonical sites to {SITES_OUTPUT} ({len(sites)} rows)")
     print(
@@ -829,6 +1092,8 @@ def main() -> None:
     )
     print(f"Wrote event members to {EVENT_MEMBERS_OUTPUT} ({len(event_members)} rows)")
     print(f"Wrote triangulated solutions to {SOLUTIONS_OUTPUT} ({len(solutions)} rows)")
+    print(f"Wrote interactive site map to {MAP_HTML_OUTPUT}")
+    print(f"Wrote static site map to {MAP_PNG_OUTPUT}")
 
     if len(solutions):
         n_pass = int(solutions["quality_pass"].sum())

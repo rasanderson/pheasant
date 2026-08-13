@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pheasant recorder locations</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { width: 100%; height: 100%; }
+    body { font-family: system-ui, sans-serif; }
+    .site-tooltip {
+      background: rgba(20, 20, 20, 0.88);
+      color: white;
+      border: 0;
+      border-radius: 6px;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+      padding: 4px 8px;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const sites = [
+  {
+    "site_id": 1,
+    "label": "Recorder 1",
+    "n_detections": 12,
+    "lon": -1.9177199886877283,
+    "lat": 50.942789994940796
+  },
+  {
+    "site_id": 2,
+    "label": "Recorder 2",
+    "n_detections": 30,
+    "lon": -1.9183399712301719,
+    "lat": 50.94073999492704
+  },
+  {
+    "site_id": 3,
+    "label": "Recorder 3",
+    "n_detections": 31,
+    "lon": -1.9206599886896285,
+    "lat": 50.94220999494029
+  },
+  {
+    "site_id": 4,
+    "label": "Recorder 4",
+    "n_detections": 3,
+    "lon": -1.9213399886910831,
+    "lat": 50.94016999493874
+  },
+  {
+    "site_id": 5,
+    "label": "Recorder 5",
+    "n_detections": 36,
+    "lon": -1.9233999886913513,
+    "lat": 50.941759994939886
+  },
+  {
+    "site_id": 6,
+    "label": "Recorder 6",
+    "n_detections": 105,
+    "lon": -1.9244400048221308,
+    "lat": 50.939750007844644
+  }
+];
+    const map = L.map('map', { scrollWheelZoom: true });
+
+    const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxZoom: 20,
+    });
+    const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community',
+      maxZoom: 20,
+    });
+
+    osm.addTo(map);
+
+    const markers = L.layerGroup();
+    sites.forEach((site) => {
+      L.circleMarker([site.lat, site.lon], {
+        radius: 8,
+        color: '#ffffff',
+        weight: 2,
+        fillColor: '#e44',
+        fillOpacity: 0.95,
+      })
+        .bindTooltip(site.label, { permanent: true, direction: 'top', offset: [0, -8], className: 'site-tooltip' })
+        .bindPopup(`<strong>${site.label}</strong><br/>Detections: ${site.n_detections}<br/>Lon: ${site.lon.toFixed(6)}<br/>Lat: ${site.lat.toFixed(6)}`)
+        .addTo(markers);
+    });
+
+    markers.addTo(map);
+    L.control.layers({ 'OpenStreetMap': osm, 'Satellite': satellite }, { 'Recorder locations': markers }, { collapsed: false }).addTo(map);
+    map.fitBounds([[50.93899001107061, -1.9261200088557315], [50.94354999171483, -1.9160399846541276]], { padding: [30, 30] });
+  </script>
+</body>
+</html>
