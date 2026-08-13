@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -39,7 +40,7 @@ TDOA_THRESHOLD_MS = 0.025
 EVENT_WINDOW_SECONDS = 0.75
 MIN_SITES_PER_EVENT = 3
 EVENT_WINDOW_SWEEP_SECONDS = [0.5, 0.75, 1.0, 2.0, 5.0, 10.0, 15.0]
-MAX_PAIR_DELTA_SECONDS = 30.0
+MAX_PAIR_DELTA_SECONDS = 45.0
 
 # Site clustering parameters in metres.
 TARGET_SITE_COUNT = 6
@@ -99,6 +100,19 @@ class OffsetCalibration:
     reference_site_id: int
     offsets_s: dict[int, float]
     site_pair_stats: pd.DataFrame
+
+
+def extract_recorder_number(recorder_folder: str) -> int:
+    """Extract recorder number from values like 'Recorder 3 - 1004 to 1704'."""
+
+    if not isinstance(recorder_folder, str):
+        raise ValueError(f"Invalid recorder_folder value: {recorder_folder!r}")
+
+    match = re.search(r"Recorder\s+(\d+)", recorder_folder)
+    if not match:
+        raise ValueError(f"Could not parse recorder number from: {recorder_folder!r}")
+
+    return int(match.group(1))
 
 
 def parse_coordinate(coord: str) -> float:
@@ -270,6 +284,9 @@ def load_and_prepare_data(files: Iterable[str]) -> pd.DataFrame:
     combined = combined[combined["tdoa_ms"].abs() >= TDOA_THRESHOLD_MS].copy()
     print(f"Rows after TDOA filter >= {TDOA_THRESHOLD_MS} ms: {len(combined)}")
 
+    # Use recorder number as the canonical site identifier.
+    combined["site_id"] = combined["recorder_folder"].map(extract_recorder_number)
+
     # Parse coordinates once into decimal degrees.
     combined["lon_deg"] = combined["LON"].map(parse_coordinate)
     combined["lat_deg"] = combined["LAT"].map(parse_coordinate)
@@ -351,22 +368,43 @@ def calibrate_site_clock_offsets(df: pd.DataFrame) -> OffsetCalibration:
     offsets = {reference_site: 0.0}
     stats_rows = []
 
-    site_times = {
-        int(site_id): grp["event_time"].sort_values().to_numpy()
-        for site_id, grp in df.groupby("site_id")
-    }
+    # Match only within the same DATE/TIME minute block.
+    # This prevents unrelated calls from being paired across different recordings.
+    df_blocks = df.copy()
+    df_blocks["time_block"] = [
+        ts.strftime("%Y-%m-%d_%H:%M")
+        for ts in df_blocks["recording_start"]
+    ]
 
-    ref_times = site_times[reference_site]
+    ref_rows = df_blocks[df_blocks["site_id"] == reference_site].copy()
 
-    for site_id in sorted(site_times):
+    for site_id in sorted(df_blocks["site_id"].unique()):
         if site_id == reference_site:
             continue
 
-        deltas = estimate_nearest_neighbor_deltas(
-            ref_times,
-            site_times[site_id],
-            max_abs_delta_s=MAX_PAIR_DELTA_SECONDS,
-        )
+        site_rows = df_blocks[df_blocks["site_id"] == site_id].copy()
+
+        ref_blocks = {
+            block: grp["event_time"].sort_values().to_numpy()
+            for block, grp in ref_rows.groupby("time_block")
+        }
+        site_blocks = {
+            block: grp["event_time"].sort_values().to_numpy()
+            for block, grp in site_rows.groupby("time_block")
+        }
+
+        common_blocks = sorted(set(ref_blocks).intersection(site_blocks))
+        deltas = []
+        for block in common_blocks:
+            block_deltas = estimate_nearest_neighbor_deltas(
+                ref_blocks[block],
+                site_blocks[block],
+                max_abs_delta_s=MAX_PAIR_DELTA_SECONDS,
+            )
+            if len(block_deltas):
+                deltas.extend(block_deltas.tolist())
+
+        deltas = np.array(deltas, dtype=float)
 
         if len(deltas) == 0:
             median_delta = 0.0
@@ -413,47 +451,17 @@ def apply_site_clock_offsets(df: pd.DataFrame, calibration: OffsetCalibration) -
 
 
 def assign_canonical_sites(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Collapse near-duplicate recorder locations and assign site_id to each row."""
-
-    unique_locs = (
-        df.groupby(["LON", "LAT", "lon_deg", "lat_deg", "easting_m", "northing_m"], as_index=False)
-        .size()
-        .rename(columns={"size": "record_count"})
-    )
-
-    # Very sparse locations are typically one-off placement anomalies and can
-    # force an extra pseudo-site. Exclude them from canonical site inference.
-    core_locs = unique_locs[unique_locs["record_count"] >= MIN_RECORDS_PER_LOCATION].copy()
-    dropped_locs = len(unique_locs) - len(core_locs)
-    if dropped_locs:
-        print(
-            f"Dropping {dropped_locs} low-support location(s) "
-            f"(< {MIN_RECORDS_PER_LOCATION} records) before site clustering."
-        )
-
-    if core_locs.empty:
-        raise RuntimeError("No locations available for site clustering after support filter.")
-
-    selection = choose_site_clusters(core_locs, TARGET_SITE_COUNT)
-    core_locs["site_cluster"] = selection.labels
+    """Assign recorder-based sites and compute per-site median coordinates."""
 
     site_rows = []
-    for cluster_id, block in core_locs.groupby("site_cluster"):
-        weights = block["record_count"].to_numpy(dtype=float)
-        e_values = block["easting_m"].to_numpy(dtype=float)
-        n_values = block["northing_m"].to_numpy(dtype=float)
-
-        canonical_e = weighted_median(e_values, weights)
-        canonical_n = weighted_median(n_values, weights)
-
+    for site_id, block in df.groupby("site_id"):
         site_rows.append(
             {
-                "site_id": int(cluster_id),
-                "cluster_radius_m": selection.radius_m,
-                "cluster_member_locations": len(block),
-                "cluster_record_count": int(block["record_count"].sum()),
-                "canonical_easting_m": canonical_e,
-                "canonical_northing_m": canonical_n,
+                "site_id": int(site_id),
+                "n_detections": int(len(block)),
+                "n_unique_locations": int(block[["LON", "LAT"]].drop_duplicates().shape[0]),
+                "canonical_easting_m": float(block["easting_m"].median()),
+                "canonical_northing_m": float(block["northing_m"].median()),
             }
         )
 
@@ -468,17 +476,6 @@ def assign_canonical_sites(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     sites["canonical_lon_deg"] = lon
     sites["canonical_lat_deg"] = lat
 
-    # Map each original unique coordinate to site_id.
-    mapping = core_locs[["LON", "LAT", "site_cluster"]].rename(columns={"site_cluster": "site_id"})
-    df = df.merge(mapping, on=["LON", "LAT"], how="left", validate="many_to_one")
-
-    dropped_rows = int(df["site_id"].isna().sum())
-    if dropped_rows:
-        print(
-            f"Excluding {dropped_rows} row(s) that map only to dropped low-support locations."
-        )
-        df = df[df["site_id"].notna()].copy()
-
     df["site_id"] = df["site_id"].astype(int)
 
     # Replace per-row location with canonical site coordinates for solver stability.
@@ -489,10 +486,7 @@ def assign_canonical_sites(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
         validate="many_to_one",
     )
 
-    print(
-        f"Canonical site clustering selected radius={selection.radius_m:.2f} m "
-        f"with {selection.n_clusters} site(s)."
-    )
+    print(f"Assigned {len(sites)} recorder-based site(s) with median coordinates.")
 
     return df, sites
 
