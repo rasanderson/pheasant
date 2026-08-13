@@ -1041,6 +1041,59 @@ def count_multi_site_events(df: pd.DataFrame, window_seconds: float, min_sites: 
     return int((site_counts >= min_sites).sum())
 
 
+def pairwise_time_alignment_matrix(
+    df: pd.DataFrame,
+    max_delta_s: float = 5.0,
+) -> pd.DataFrame:
+    """Count nearest-neighbor timestamps shared between recorder pairs."""
+
+    if df.empty:
+        return pd.DataFrame(columns=["site_a", "site_b", "n_matches", "median_delta_s", "max_delta_s"])
+
+    site_ids = sorted(df["site_id"].unique().tolist())
+    rows = []
+
+    for site_a, site_b in itertools.combinations(site_ids, 2):
+        a_times = df.loc[df["site_id"] == site_a, "corrected_event_time"].sort_values().to_numpy()
+        b_times = df.loc[df["site_id"] == site_b, "corrected_event_time"].sort_values().to_numpy()
+        if len(a_times) == 0 or len(b_times) == 0:
+            continue
+
+        a_ns = np.array([pd.Timestamp(ts).value for ts in a_times], dtype=np.int64)
+        b_ns = np.array([pd.Timestamp(ts).value for ts in b_times], dtype=np.int64)
+
+        deltas = []
+        for a_ns_val in a_ns:
+            idx = np.searchsorted(b_ns, a_ns_val)
+            candidates = []
+            if idx > 0:
+                candidates.append(b_ns[idx - 1])
+            if idx < len(b_ns):
+                candidates.append(b_ns[idx])
+            if not candidates:
+                continue
+            nearest = min(candidates, key=lambda v: abs(int(v) - int(a_ns_val)))
+            delta_s = abs(float(nearest - a_ns_val) / 1e9)
+            if delta_s <= max_delta_s:
+                deltas.append(delta_s)
+
+        if not deltas:
+            continue
+
+        rows.append(
+            {
+                "site_a": int(site_a),
+                "site_b": int(site_b),
+                "n_matches": int(len(deltas)),
+                "median_delta_s": float(np.median(deltas)),
+                "max_delta_s": float(np.max(deltas)),
+                "min_delta_s": float(np.min(deltas)),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values(["n_matches", "median_delta_s"], ascending=[False, True]).reset_index(drop=True)
+
+
 def build_event_matching_diagnostics(
     raw_df: pd.DataFrame,
     corrected_df: pd.DataFrame,
@@ -1068,6 +1121,66 @@ def build_event_matching_diagnostics(
             f"  window={window_s:.1f}s -> raw={raw_count}, corrected={corrected_count}, "
             f"delta={corrected_count - raw_count}"
         )
+
+    pair_matrix = pairwise_time_alignment_matrix(corrected_df, max_delta_s=5.0)
+    print("\nCross-recorder pair alignment matrix (nearest-neighbor matches within 5s):")
+    if pair_matrix.empty:
+        print("  no recorder pairs have any nearest-neighbor matches within 5s")
+    else:
+        print(pair_matrix.to_string(index=False))
+
+    print("\nCandidate pair timestamps (recorder, datetime, delta):")
+    pair_candidates = []
+    for site_a, site_b in itertools.combinations(sorted(corrected_df["site_id"].unique()), 2):
+        a_times = corrected_df.loc[corrected_df["site_id"] == site_a, ["corrected_event_time", "wav_file", "peak_time_s"]].sort_values("corrected_event_time").reset_index(drop=True)
+        b_times = corrected_df.loc[corrected_df["site_id"] == site_b, ["corrected_event_time", "wav_file", "peak_time_s"]].sort_values("corrected_event_time").reset_index(drop=True)
+        if a_times.empty or b_times.empty:
+            continue
+
+        for _, row_a in a_times.iterrows():
+            best_delta = None
+            best_row_b = None
+            for _, row_b in b_times.iterrows():
+                delta_s = abs((row_b["corrected_event_time"] - row_a["corrected_event_time"]).total_seconds())
+                if best_delta is None or delta_s < best_delta:
+                    best_delta = delta_s
+                    best_row_b = row_b
+            if best_delta is not None and best_delta <= 5.0:
+                pair_candidates.append(
+                    {
+                        "site_a": int(site_a),
+                        "site_b": int(site_b),
+                        "time_a": row_a["corrected_event_time"],
+                        "time_b": best_row_b["corrected_event_time"],
+                        "delta_s": float(best_delta),
+                        "wav_a": str(row_a["wav_file"]),
+                        "wav_b": str(best_row_b["wav_file"]),
+                        "peak_a_s": float(row_a["peak_time_s"]),
+                        "peak_b_s": float(best_row_b["peak_time_s"]),
+                    }
+                )
+
+    if not pair_candidates:
+        print("  no candidate recorder pairs within 5s")
+    else:
+        for entry in sorted(pair_candidates, key=lambda x: x["delta_s"])[:20]:
+            print(
+                f"  recorder {entry['site_a']} vs {entry['site_b']} | "
+                f"{entry['site_a']}: {entry['time_a']} ({entry['wav_a']}, peak={entry['peak_a_s']}) | "
+                f"{entry['site_b']}: {entry['time_b']} ({entry['wav_b']}, peak={entry['peak_b_s']}) | "
+                f"delta={entry['delta_s']:.3f}s"
+            )
+
+    matrix = pd.DataFrame(index=sorted(corrected_df["site_id"].unique()), columns=sorted(corrected_df["site_id"].unique()), dtype=int)
+    for site_a, site_b in itertools.combinations(sorted(corrected_df["site_id"].unique()), 2):
+        matches = pair_matrix[(pair_matrix["site_a"] == site_a) & (pair_matrix["site_b"] == site_b)]
+        value = int(matches["n_matches"].iloc[0]) if not matches.empty else 0
+        matrix.at[site_a, site_b] = value
+        matrix.at[site_b, site_a] = value
+    for site_id in matrix.index:
+        matrix.at[site_id, site_id] = 0
+    print("\nRecorder pair count matrix:")
+    print(matrix.fillna(0).astype(int).to_string())
 
     debug_event_candidates(corrected_df, EVENT_WINDOW_SECONDS)
 
