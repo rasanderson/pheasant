@@ -283,6 +283,7 @@ def load_and_prepare_data(files: Iterable[str]) -> pd.DataFrame:
     # Keep rows with sufficient directional information.
     combined = combined[combined["tdoa_ms"].abs() >= TDOA_THRESHOLD_MS].copy()
     print(f"Rows after TDOA filter >= {TDOA_THRESHOLD_MS} ms: {len(combined)}")
+    print(f"Calls retained after TDOA filtering: {len(combined)}")
 
     # Use recorder number as the canonical site identifier.
     combined["site_id"] = combined["recorder_folder"].map(extract_recorder_number)
@@ -475,6 +476,16 @@ def assign_canonical_sites(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     )
     sites["canonical_lon_deg"] = lon
     sites["canonical_lat_deg"] = lat
+
+    # Print a readable per-site summary for quick field sanity checks.
+    print("Recorder-site median coordinates and call counts:")
+    for row in sites.itertuples(index=False):
+        print(
+            f"  Recorder {int(row.site_id)}: "
+            f"lon={row.canonical_lon_deg:.8f}, "
+            f"lat={row.canonical_lat_deg:.8f}, "
+            f"calls={int(row.n_detections)}"
+        )
 
     df["site_id"] = df["site_id"].astype(int)
 
