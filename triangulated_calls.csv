@@ -1,0 +1,1 @@
+event_id,n_sites,event_time_min,event_time_max,triangulation_success,quality_pass,solution_easting_m,solution_northing_m,solution_lon_deg,solution_lat_deg,branch_bits,objective,rms_residual_deg,geometry_score,branch_margin,chosen_bearings_deg
