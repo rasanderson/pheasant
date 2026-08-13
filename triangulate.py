@@ -16,10 +16,10 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections.abc import Iterable
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -38,6 +38,8 @@ INPUT_FILES = [
 TDOA_THRESHOLD_MS = 0.025
 EVENT_WINDOW_SECONDS = 0.75
 MIN_SITES_PER_EVENT = 3
+EVENT_WINDOW_SWEEP_SECONDS = [0.5, 0.75, 1.0, 2.0, 5.0, 10.0, 15.0]
+MAX_PAIR_DELTA_SECONDS = 30.0
 
 # Site clustering parameters in metres.
 TARGET_SITE_COUNT = 6
@@ -60,6 +62,8 @@ MIN_BRANCH_MARGIN = 0.2
 SITES_OUTPUT = "triangulation_sites.csv"
 EVENT_MEMBERS_OUTPUT = "triangulation_event_members.csv"
 SOLUTIONS_OUTPUT = "triangulated_calls.csv"
+EVENT_DIAGNOSTICS_OUTPUT = "event_matching_diagnostics.csv"
+PAIRWISE_OFFSET_OUTPUT = "site_pair_offset_estimates.csv"
 
 # Local field time zone used to attach tzinfo to parsed local timestamps.
 FIELD_TIMEZONE = ZoneInfo("Europe/London")
@@ -86,6 +90,15 @@ class TriangulationResult:
     rms_residual_deg: float
     geometry_score: float
     branch_margin: float
+
+
+@dataclass
+class OffsetCalibration:
+    """Per-site time offsets relative to a reference site."""
+
+    reference_site_id: int
+    offsets_s: dict[int, float]
+    site_pair_stats: pd.DataFrame
 
 
 def parse_coordinate(coord: str) -> float:
@@ -281,6 +294,124 @@ def load_and_prepare_data(files: Iterable[str]) -> pd.DataFrame:
     return combined
 
 
+def estimate_nearest_neighbor_deltas(
+    a_times: np.ndarray,
+    b_times: np.ndarray,
+    max_abs_delta_s: float,
+) -> np.ndarray:
+    """Estimate nearest-neighbor time deltas between two sorted timestamp arrays.
+
+    Returned deltas are (b - a) in seconds for each timestamp in a where the
+    closest b timestamp is within max_abs_delta_s.
+    """
+
+    if len(a_times) == 0 or len(b_times) == 0:
+        return np.array([], dtype=float)
+
+    b_ns = np.array([pd.Timestamp(ts).value for ts in b_times], dtype=np.int64)
+    deltas = []
+
+    for a in a_times:
+        a_ns = int(pd.Timestamp(a).value)
+        idx = np.searchsorted(b_ns, a_ns)
+
+        candidates = []
+        if idx > 0:
+            candidates.append(b_ns[idx - 1])
+        if idx < len(b_ns):
+            candidates.append(b_ns[idx])
+
+        if not candidates:
+            continue
+
+        cand = min(candidates, key=lambda x: abs(x - a_ns))
+        delta_s = (cand - a_ns) / 1e9
+        if abs(delta_s) <= max_abs_delta_s:
+            deltas.append(delta_s)
+
+    return np.array(deltas, dtype=float)
+
+
+def calibrate_site_clock_offsets(df: pd.DataFrame) -> OffsetCalibration:
+    """Estimate and apply per-site clock offsets from nearest-neighbor timing.
+
+    Strategy:
+    1. Choose the highest-support site as the reference site.
+    2. For each other site, estimate delta = (site - reference) from nearest
+       neighbor timestamp matches under MAX_PAIR_DELTA_SECONDS.
+    3. Use the median delta as robust pairwise offset and set correction to
+       negative delta so corrected time aligns with reference.
+    """
+
+    site_counts = df.groupby("site_id").size().sort_values(ascending=False)
+    if site_counts.empty:
+        raise RuntimeError("Cannot calibrate offsets: no site rows available.")
+
+    reference_site = int(site_counts.index[0])
+    offsets = {reference_site: 0.0}
+    stats_rows = []
+
+    site_times = {
+        int(site_id): grp["event_time"].sort_values().to_numpy()
+        for site_id, grp in df.groupby("site_id")
+    }
+
+    ref_times = site_times[reference_site]
+
+    for site_id in sorted(site_times):
+        if site_id == reference_site:
+            continue
+
+        deltas = estimate_nearest_neighbor_deltas(
+            ref_times,
+            site_times[site_id],
+            max_abs_delta_s=MAX_PAIR_DELTA_SECONDS,
+        )
+
+        if len(deltas) == 0:
+            median_delta = 0.0
+            mad_delta = np.nan
+            p10 = np.nan
+            p90 = np.nan
+        else:
+            median_delta = float(np.median(deltas))
+            mad_delta = float(np.median(np.abs(deltas - median_delta)))
+            p10, p90 = np.percentile(deltas, [10, 90])
+
+        offsets[site_id] = -median_delta
+        stats_rows.append(
+            {
+                "reference_site_id": reference_site,
+                "other_site_id": site_id,
+                "n_matches": len(deltas),
+                "median_delta_s_other_minus_ref": median_delta,
+                "mad_delta_s": mad_delta,
+                "p10_delta_s": p10,
+                "p90_delta_s": p90,
+                "applied_correction_s": -median_delta,
+            }
+        )
+
+    stats = pd.DataFrame(stats_rows)
+    return OffsetCalibration(
+        reference_site_id=reference_site,
+        offsets_s=offsets,
+        site_pair_stats=stats,
+    )
+
+
+def apply_site_clock_offsets(df: pd.DataFrame, calibration: OffsetCalibration) -> pd.DataFrame:
+    """Apply per-site clock-offset corrections to produce corrected_event_time."""
+
+    out = df.copy()
+    out["clock_offset_s"] = out["site_id"].map(calibration.offsets_s).fillna(0.0)
+    out["corrected_event_time"] = [
+        ts + timedelta(seconds=float(offset_s))
+        for ts, offset_s in zip(out["event_time"], out["clock_offset_s"], strict=False)
+    ]
+    return out
+
+
 def assign_canonical_sites(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Collapse near-duplicate recorder locations and assign site_id to each row."""
 
@@ -369,15 +500,15 @@ def assign_canonical_sites(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
 def build_events(df: pd.DataFrame) -> pd.DataFrame:
     """Group detections into call events by temporal proximity and unique sites."""
 
-    ordered = df.sort_values("event_time").copy().reset_index(drop=True)
+    ordered = df.sort_values("corrected_event_time").copy().reset_index(drop=True)
 
     # Greedy temporal segmentation: rows within EVENT_WINDOW_SECONDS belong to
     # the same provisional event block.
     event_ids = []
     current_event = 0
-    current_anchor = ordered.loc[0, "event_time"] if len(ordered) else None
+    current_anchor = ordered.loc[0, "corrected_event_time"] if len(ordered) else None
 
-    for row_time in ordered["event_time"]:
+    for row_time in ordered["corrected_event_time"]:
         if current_anchor is None:
             current_anchor = row_time
         elif (row_time - current_anchor).total_seconds() > EVENT_WINDOW_SECONDS:
@@ -392,7 +523,7 @@ def build_events(df: pd.DataFrame) -> pd.DataFrame:
     deduped = (
         ordered.sort_values("abs_tdoa_ms", ascending=False)
         .drop_duplicates(subset=["event_id", "site_id"], keep="first")
-        .sort_values(["event_id", "event_time"])
+        .sort_values(["event_id", "corrected_event_time"])
         .reset_index(drop=True)
     )
 
@@ -406,6 +537,79 @@ def build_events(df: pd.DataFrame) -> pd.DataFrame:
 
     print(f"Events with >= {MIN_SITES_PER_EVENT} unique sites: {deduped['event_id'].nunique()}")
     return deduped
+
+
+def count_multi_site_events(df: pd.DataFrame, window_seconds: float, min_sites: int) -> int:
+    """Count events with at least min_sites unique sites for a given window size."""
+
+    ordered = df.sort_values("corrected_event_time").copy().reset_index(drop=True)
+    if ordered.empty:
+        return 0
+
+    event_ids = []
+    current_event = 0
+    current_anchor = ordered.loc[0, "corrected_event_time"]
+
+    for row_time in ordered["corrected_event_time"]:
+        if (row_time - current_anchor).total_seconds() > window_seconds:
+            current_event += 1
+            current_anchor = row_time
+        event_ids.append(current_event)
+
+    ordered["event_id"] = event_ids
+    ordered["abs_tdoa_ms"] = ordered["tdoa_ms"].abs()
+    deduped = ordered.sort_values("abs_tdoa_ms", ascending=False).drop_duplicates(
+        subset=["event_id", "site_id"],
+        keep="first",
+    )
+
+    site_counts = deduped.groupby("event_id")["site_id"].nunique()
+    return int((site_counts >= min_sites).sum())
+
+
+def build_event_matching_diagnostics(
+    raw_df: pd.DataFrame,
+    corrected_df: pd.DataFrame,
+    calibration: OffsetCalibration,
+) -> pd.DataFrame:
+    """Create diagnostics for timing alignment and event-window sensitivity."""
+
+    rows = []
+
+    for window_s in EVENT_WINDOW_SWEEP_SECONDS:
+        raw_count = count_multi_site_events(raw_df.assign(corrected_event_time=raw_df["event_time"]), window_s, MIN_SITES_PER_EVENT)
+        corrected_count = count_multi_site_events(corrected_df, window_s, MIN_SITES_PER_EVENT)
+        rows.append(
+            {
+                "diagnostic_type": "window_sweep",
+                "window_seconds": float(window_s),
+                "multi_site_events_raw": raw_count,
+                "multi_site_events_offset_corrected": corrected_count,
+                "improvement": corrected_count - raw_count,
+                "reference_site_id": calibration.reference_site_id,
+            }
+        )
+
+    for _, row in calibration.site_pair_stats.iterrows():
+        rows.append(
+            {
+                "diagnostic_type": "pair_offset",
+                "window_seconds": np.nan,
+                "multi_site_events_raw": np.nan,
+                "multi_site_events_offset_corrected": np.nan,
+                "improvement": np.nan,
+                "reference_site_id": int(row["reference_site_id"]),
+                "other_site_id": int(row["other_site_id"]),
+                "n_matches": int(row["n_matches"]),
+                "median_delta_s_other_minus_ref": row["median_delta_s_other_minus_ref"],
+                "mad_delta_s": row["mad_delta_s"],
+                "p10_delta_s": row["p10_delta_s"],
+                "p90_delta_s": row["p90_delta_s"],
+                "applied_correction_s": row["applied_correction_s"],
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def robust_residuals(
@@ -597,14 +801,27 @@ def main() -> None:
 
     combined = load_and_prepare_data(INPUT_FILES)
     combined_with_sites, sites = assign_canonical_sites(combined)
-    event_members = build_events(combined_with_sites)
+    calibration = calibrate_site_clock_offsets(combined_with_sites)
+    corrected = apply_site_clock_offsets(combined_with_sites, calibration)
+    diagnostics = build_event_matching_diagnostics(combined_with_sites, corrected, calibration)
+    event_members = build_events(corrected)
     solutions = solve_all_events(event_members)
 
     sites.to_csv(root / SITES_OUTPUT, index=False)
+    calibration.site_pair_stats.to_csv(root / PAIRWISE_OFFSET_OUTPUT, index=False)
+    diagnostics.to_csv(root / EVENT_DIAGNOSTICS_OUTPUT, index=False)
     event_members.to_csv(root / EVENT_MEMBERS_OUTPUT, index=False)
     solutions.to_csv(root / SOLUTIONS_OUTPUT, index=False)
 
     print(f"Wrote canonical sites to {SITES_OUTPUT} ({len(sites)} rows)")
+    print(
+        f"Wrote per-site offset estimates to {PAIRWISE_OFFSET_OUTPUT} "
+        f"({len(calibration.site_pair_stats)} rows)"
+    )
+    print(
+        f"Wrote event diagnostics to {EVENT_DIAGNOSTICS_OUTPUT} "
+        f"({len(diagnostics)} rows)"
+    )
     print(f"Wrote event members to {EVENT_MEMBERS_OUTPUT} ({len(event_members)} rows)")
     print(f"Wrote triangulated solutions to {SOLUTIONS_OUTPUT} ({len(solutions)} rows)")
 
