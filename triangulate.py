@@ -126,6 +126,8 @@ class TriangulationResult:
     x_m: float
     y_m: float
     chosen_bearings_deg: list[float]
+    # Bitstring selecting bearing branch per site after sorting by site_id:
+    # 0 -> bearing_1_deg, 1 -> bearing_2_deg.
     branch_bits: str
     objective: float
     rms_residual_deg: float
@@ -1452,7 +1454,12 @@ def geometry_score_from_bearings(bearings_deg: np.ndarray) -> float:
 
 
 def triangulate_one_event(event_df: pd.DataFrame) -> TriangulationResult | None:
-    """Triangulate a single event by searching all bearing-ambiguity branches."""
+    """Triangulate a single event by searching all bearing-ambiguity branches.
+
+    branch_bits in the returned result is ordered by site_id after sorting this
+    event's rows. Each character chooses the branch for that site:
+    "0" means bearing_1_deg and "1" means bearing_2_deg.
+    """
 
     event_df = event_df.sort_values("site_id").reset_index(drop=True)
     site_x = event_df["canonical_easting_m"].to_numpy(dtype=float)
@@ -1469,6 +1476,7 @@ def triangulate_one_event(event_df: pd.DataFrame) -> TriangulationResult | None:
 
     candidates = []
     for bits in itertools.product([0, 1], repeat=len(event_df)):
+        # Apply one binary branch assignment across all sites for this event.
         chosen = np.where(np.array(bits, dtype=int) == 0, b1, b2)
 
         result = least_squares(
@@ -1496,6 +1504,7 @@ def triangulate_one_event(event_df: pd.DataFrame) -> TriangulationResult | None:
             {
                 "xy": result.x,
                 "chosen": chosen,
+                # Persist branch selection as a compact bitstring.
                 "bits": "".join(str(int(v)) for v in bits),
                 "objective": float(result.cost),
                 "rms": rms,
@@ -1584,6 +1593,8 @@ def solve_all_events(events_df: pd.DataFrame) -> pd.DataFrame:
                 "solution_northing_m": solution.y_m,
                 "solution_lon_deg": lon,
                 "solution_lat_deg": lat,
+                # Bit i corresponds to site i after site_id sorting in
+                # triangulate_one_event: 0=bearing_1_deg, 1=bearing_2_deg.
                 "branch_bits": solution.branch_bits,
                 "objective": solution.objective,
                 "rms_residual_deg": solution.rms_residual_deg,
