@@ -46,6 +46,7 @@ TDOA_THRESHOLD_MS = 0.025
 # coincidence window for same-call matching across sites.
 EVENT_WINDOW_SECONDS = 180.0
 MIN_SITES_PER_EVENT = 3
+MAX_EVENTS_PER_BLOCK = 3
 EVENT_WINDOW_SWEEP_SECONDS = [0.5, 0.75, 1.0, 1.5, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 180.0]
 MAX_PAIR_DELTA_SECONDS = 180.0
 
@@ -63,7 +64,7 @@ MIN_WEIGHT = 0.05
 # This short-baseline array can show several degrees of bearing drift from
 # orientation and TDOA estimation errors, so the robust solver needs a wider
 # residual scale than the original 3° assumption.
-ORIENTATION_SIGMA_DEG = 20.0
+ORIENTATION_SIGMA_DEG = 10.0
 
 MAX_ACCEPTABLE_RMS_DEG = 18.0
 MIN_GEOMETRY_SCORE = math.sin(math.radians(10.0))
@@ -727,6 +728,10 @@ def load_and_prepare_data(files: Iterable[str]) -> pd.DataFrame:
     ]
     combined["recording_datetime"] = starts
     combined["recording_start"] = combined["recording_datetime"]
+    combined["recording_block_key"] = [
+        ts.strftime("%Y-%m-%d_%H:%M:%S")
+        for ts in combined["recording_start"]
+    ]
     combined["event_time"] = [
         start + timedelta(seconds=float(offset_s))
         for start, offset_s in zip(combined["recording_datetime"], combined["peak_time_s"], strict=False)
@@ -931,45 +936,169 @@ def assign_canonical_sites(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     return df, sites
 
 
+def _mapped_position(anchor_idx: int, anchor_count: int, site_count: int) -> int:
+    """Map anchor event order to another site's order in [0, site_count-1]."""
+
+    if site_count <= 1 or anchor_count <= 1:
+        return 0
+
+    frac = anchor_idx / (anchor_count - 1)
+    return round(frac * (site_count - 1))
+
+
+def _match_events_within_block(
+    block_df: pd.DataFrame,
+    max_events: int,
+    min_sites: int,
+) -> pd.DataFrame:
+    """Build up to max_events cross-recorder event candidates within one DATE+TIME block."""
+
+    if block_df.empty:
+        return pd.DataFrame(columns=list(block_df.columns) + ["_candidate_id", "_candidate_score", "_n_sites"])
+
+    work = block_df.copy().reset_index(names="_row_id")
+    work["abs_tdoa_ms"] = work["tdoa_ms"].abs()
+
+    by_site = {
+        int(site_id): grp.sort_values(["peak_time_s", "abs_tdoa_ms"], ascending=[True, False]).reset_index(drop=True)
+        for site_id, grp in work.groupby("site_id")
+    }
+    if not by_site:
+        return pd.DataFrame(columns=list(work.columns) + ["_candidate_id", "_candidate_score", "_n_sites"])
+
+    # Use the site with most detections as the anchor for within-block rank mapping.
+    anchor_site_id = min(by_site, key=lambda s: (-len(by_site[s]), s))
+    anchor_rows = by_site[anchor_site_id]
+    anchor_count = len(anchor_rows)
+
+    candidates = []
+    for anchor_idx in range(anchor_count):
+        picked_rows = [anchor_rows.iloc[anchor_idx]]
+        for site_id, site_rows in by_site.items():
+            if site_id == anchor_site_id:
+                continue
+            mapped_idx = _mapped_position(anchor_idx, anchor_count, len(site_rows))
+            picked_rows.append(site_rows.iloc[mapped_idx])
+
+        candidate_df = pd.DataFrame(picked_rows)
+        candidate_df = candidate_df.drop_duplicates(subset=["site_id"], keep="first")
+        n_sites = int(candidate_df["site_id"].nunique())
+        if n_sites < min_sites:
+            continue
+
+        score = float(candidate_df["abs_tdoa_ms"].sum())
+        candidate_time = candidate_df["corrected_event_time"].min()
+        candidates.append(
+            {
+                "rows": candidate_df,
+                "n_sites": n_sites,
+                "score": score,
+                "candidate_time": candidate_time,
+            }
+        )
+
+    if not candidates:
+        return pd.DataFrame(columns=list(work.columns) + ["_candidate_id", "_candidate_score", "_n_sites"])
+
+    # Prioritize highest site support first, then strongest directional support.
+    candidates = sorted(
+        candidates,
+        key=lambda c: (-c["n_sites"], -c["score"], c["candidate_time"]),
+    )
+
+    retained = []
+    used_row_ids = set()
+    for candidate in candidates:
+        row_ids = {int(v) for v in candidate["rows"]["_row_id"].tolist()}
+        if row_ids & used_row_ids:
+            continue
+        retained.append(candidate)
+        used_row_ids |= row_ids
+        if len(retained) >= max_events:
+            break
+
+    if not retained:
+        return pd.DataFrame(columns=list(work.columns) + ["_candidate_id", "_candidate_score", "_n_sites"])
+
+    out_frames = []
+    for candidate_id, candidate in enumerate(retained):
+        frame = candidate["rows"].copy()
+        frame["_candidate_id"] = int(candidate_id)
+        frame["_candidate_score"] = float(candidate["score"])
+        frame["_n_sites"] = int(candidate["n_sites"])
+        out_frames.append(frame)
+
+    out = pd.concat(out_frames, ignore_index=True)
+    return out
+
+
 def build_events(df: pd.DataFrame) -> pd.DataFrame:
-    """Group detections into call events by temporal proximity and unique sites."""
+    """Group detections into DATE+TIME block events with capped call candidates."""
 
-    ordered = df.sort_values("corrected_event_time").copy().reset_index(drop=True)
+    if df.empty:
+        return df.copy()
 
-    # Greedy temporal segmentation: rows within EVENT_WINDOW_SECONDS belong to
-    # the same provisional event block.
-    event_ids = []
-    current_event = 0
-    current_anchor = ordered.loc[0, "corrected_event_time"] if len(ordered) else None
+    if "recording_block_key" not in df.columns:
+        fallback = df.copy()
+        fallback["recording_block_key"] = [
+            ts.strftime("%Y-%m-%d_%H:%M:%S")
+            for ts in fallback["recording_start"]
+        ]
+        df = fallback
 
-    for row_time in ordered["corrected_event_time"]:
-        if current_anchor is None:
-            current_anchor = row_time
-        elif (row_time - current_anchor).total_seconds() > EVENT_WINDOW_SECONDS:
-            current_event += 1
-            current_anchor = row_time
-        event_ids.append(current_event)
+    all_rows = []
+    for block_key, block in df.groupby("recording_block_key"):
+        block_matches = _match_events_within_block(
+            block,
+            max_events=MAX_EVENTS_PER_BLOCK,
+            min_sites=MIN_SITES_PER_EVENT,
+        )
+        if block_matches.empty:
+            continue
 
-    ordered["event_id"] = event_ids
+        block_matches["recording_block_key"] = block_key
+        all_rows.append(block_matches)
 
-    # Within each event and site, keep the strongest directional cue.
-    ordered["abs_tdoa_ms"] = ordered["tdoa_ms"].abs()
+    if not all_rows:
+        print(f"Events with >= {MIN_SITES_PER_EVENT} unique sites: 0")
+        return pd.DataFrame(columns=list(df.columns) + ["event_id", "abs_tdoa_ms"])
+
+    matched = pd.concat(all_rows, ignore_index=True)
+
+    # Build deterministic global event IDs from block key and local candidate index.
+    event_keys = matched[["recording_block_key", "_candidate_id"]].drop_duplicates().sort_values(
+        ["recording_block_key", "_candidate_id"]
+    )
+    event_keys["event_id"] = np.arange(len(event_keys), dtype=int)
+
+    matched = matched.merge(
+        event_keys,
+        on=["recording_block_key", "_candidate_id"],
+        how="left",
+        validate="many_to_one",
+    )
+
+    # Keep one row per event/site by strongest directional cue, preserving new event IDs.
     deduped = (
-        ordered.sort_values("abs_tdoa_ms", ascending=False)
+        matched.sort_values("abs_tdoa_ms", ascending=False)
         .drop_duplicates(subset=["event_id", "site_id"], keep="first")
         .sort_values(["event_id", "corrected_event_time"])
         .reset_index(drop=True)
     )
 
-    site_counts = deduped.groupby("event_id")["site_id"].nunique()
-    valid_events = site_counts[site_counts >= MIN_SITES_PER_EVENT].index
-    deduped = deduped[deduped["event_id"].isin(valid_events)].copy()
+    keep_columns = [c for c in df.columns if c in deduped.columns]
+    keep_columns.extend(["event_id", "abs_tdoa_ms"])
+    deduped = deduped[keep_columns]
 
-    # Renumber event IDs to a compact sequence for cleaner outputs.
-    remap = {old: new for new, old in enumerate(sorted(deduped["event_id"].unique()))}
-    deduped["event_id"] = deduped["event_id"].map(remap)
-
+    block_event_counts = (
+        event_keys.groupby("recording_block_key").size().sort_values(ascending=False)
+    )
+    print(
+        "DATE+TIME blocks with retained call-events (capped at "
+        f"{MAX_EVENTS_PER_BLOCK} per block): {int((block_event_counts > 0).sum())}"
+    )
     print(f"Events with >= {MIN_SITES_PER_EVENT} unique sites: {deduped['event_id'].nunique()}")
+
     return deduped
 
 
