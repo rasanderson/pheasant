@@ -69,6 +69,7 @@ ORIENTATION_SIGMA_DEG = 10.0
 MAX_ACCEPTABLE_RMS_DEG = 18.0
 MIN_GEOMETRY_SCORE = math.sin(math.radians(10.0))
 MIN_BRANCH_MARGIN = 0.2
+MAX_TRIANGULATION_DISTANCE_M = 1000.0
 
 # Output files.
 SITES_OUTPUT = "triangulation_sites.csv"
@@ -1462,7 +1463,7 @@ def triangulate_one_event(event_df: pd.DataFrame) -> TriangulationResult | None:
 
     x0 = np.array([np.mean(site_x), np.mean(site_y)], dtype=float)
 
-    pad = 1000.0
+    pad = MAX_TRIANGULATION_DISTANCE_M
     lower = np.array([site_x.min() - pad, site_y.min() - pad], dtype=float)
     upper = np.array([site_x.max() + pad, site_y.max() + pad], dtype=float)
 
@@ -1480,6 +1481,10 @@ def triangulate_one_event(event_df: pd.DataFrame) -> TriangulationResult | None:
         )
 
         if not result.success:
+            continue
+
+        distances_m = np.sqrt((result.x[0] - site_x) ** 2 + (result.x[1] - site_y) ** 2)
+        if np.any(distances_m > MAX_TRIANGULATION_DISTANCE_M):
             continue
 
         pred = bearing_from_points_deg(site_x, site_y, x=result.x[0], y=result.x[1])
