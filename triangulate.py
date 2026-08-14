@@ -194,6 +194,31 @@ def _bearing_line_records(detections: pd.DataFrame) -> list[dict[str, float | in
     return records
 
 
+def _triangulated_call_records(solutions: pd.DataFrame) -> list[dict[str, float | int | bool]]:
+    """Convert solved triangulation rows into map marker records."""
+
+    if solutions.empty:
+        return []
+
+    records = []
+    solved = solutions[solutions["triangulation_success"] == True].copy()
+    solved = solved.dropna(subset=["solution_lon_deg", "solution_lat_deg"])
+    solved = solved.sort_values("event_id")
+
+    for row in solved.itertuples(index=False):
+        records.append(
+            {
+                "event_id": int(row.event_id),
+                "n_sites": int(row.n_sites),
+                "quality_pass": bool(row.quality_pass),
+                "lon": float(row.solution_lon_deg),
+                "lat": float(row.solution_lat_deg),
+            }
+        )
+
+    return records
+
+
 def _site_bounds(records: list[dict[str, float | int | str]], pad_fraction: float = 0.25) -> tuple[float, float, float, float]:
     """Return lon/lat bounds expanded by a fractional margin."""
 
@@ -265,7 +290,12 @@ def _world_px_to_canvas_px(
     return world_x - canvas_origin_x, world_y - canvas_origin_y
 
 
-def write_interactive_site_map(sites: pd.DataFrame, detections: pd.DataFrame, output_path: Path) -> None:
+def write_interactive_site_map(
+    sites: pd.DataFrame,
+    detections: pd.DataFrame,
+    solutions: pd.DataFrame,
+    output_path: Path,
+) -> None:
     """Write a lightweight Leaflet map showing recorder locations."""
 
     records = _site_map_records(sites)
@@ -273,10 +303,12 @@ def write_interactive_site_map(sites: pd.DataFrame, detections: pd.DataFrame, ou
         raise RuntimeError("Cannot write map: no sites provided.")
 
     bearing_records = _bearing_line_records(detections)
+    call_records = _triangulated_call_records(solutions)
     bounds = _site_bounds(records)
     lon_min, lat_min, lon_max, lat_max = bounds
     site_json = json.dumps(records, indent=2)
     bearing_json = json.dumps(bearing_records, indent=2)
+    call_json = json.dumps(call_records, indent=2)
 
     html = f"""<!doctype html>
 <html lang=\"en\">
@@ -326,7 +358,8 @@ def write_interactive_site_map(sites: pd.DataFrame, detections: pd.DataFrame, ou
   <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
   <script>
     const sites = {site_json};
-        const bearings = {bearing_json};
+    const bearings = {bearing_json};
+    const triangulatedCalls = {call_json};
     const map = L.map('map', {{ scrollWheelZoom: true }});
 
     const osm = L.tileLayer('{OSM_TILE_SOURCE['url']}', {{
@@ -341,7 +374,8 @@ def write_interactive_site_map(sites: pd.DataFrame, detections: pd.DataFrame, ou
     osm.addTo(map);
 
     const markers = L.layerGroup();
-        const bearingLines = L.layerGroup();
+    const bearingLines = L.layerGroup();
+    const triangulatedCallMarkers = L.layerGroup();
 
         function destinationPoint(lat, lon, bearingDeg, distanceM) {{
             const earthRadiusM = 6378137.0;
@@ -412,10 +446,31 @@ def write_interactive_site_map(sites: pd.DataFrame, detections: pd.DataFrame, ou
         .addTo(markers);
     }});
 
+        triangulatedCalls.forEach((call) => {{
+            L.circleMarker([call.lat, call.lon], {{
+                radius: 6,
+                color: '#0f5132',
+                weight: 2,
+                fillColor: call.quality_pass ? '#2ecc71' : '#f39c12',
+                fillOpacity: 0.95,
+            }})
+                .bindPopup(
+                    `<strong>Triangulated call ${{call.event_id}}</strong><br/>` +
+                    `Sites: ${{call.n_sites}}<br/>` +
+                    `Quality pass: ${{call.quality_pass ? 'yes' : 'no'}}<br/>` +
+                    `Lon: ${{call.lon.toFixed(6)}}<br/>Lat: ${{call.lat.toFixed(6)}}`
+                )
+                .addTo(triangulatedCallMarkers);
+        }});
+
     markers.addTo(map);
         L.control.layers(
             {{ 'OpenStreetMap': osm, 'Satellite': satellite }},
-            {{ 'Recorder locations': markers, 'Bearing lines': bearingLines }},
+            {{
+                'Recorder locations': markers,
+                'Bearing lines': bearingLines,
+                'Triangulated calls': triangulatedCallMarkers,
+            }},
             {{ collapsed: false }}
         ).addTo(map);
 
@@ -1580,7 +1635,7 @@ def main() -> None:
     diagnostics.to_csv(root / EVENT_DIAGNOSTICS_OUTPUT, index=False)
     event_members.to_csv(root / EVENT_MEMBERS_OUTPUT, index=False)
     solutions.to_csv(root / SOLUTIONS_OUTPUT, index=False)
-    write_interactive_site_map(sites, combined_with_sites, root / MAP_HTML_OUTPUT)
+    write_interactive_site_map(sites, combined_with_sites, solutions, root / MAP_HTML_OUTPUT)
     write_static_site_map(sites, root / MAP_PNG_OUTPUT)
 
     print(f"Wrote canonical sites to {SITES_OUTPUT} ({len(sites)} rows)")

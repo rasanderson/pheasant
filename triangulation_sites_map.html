@@ -89,7 +89,7 @@
     "lat": 50.939750007844644
   }
 ];
-        const bearings = [
+    const bearings = [
   {
     "det_id": 1,
     "site_id": 1,
@@ -3563,6 +3563,78 @@
     "center_lat": 50.939750007844644
   }
 ];
+    const triangulatedCalls = [
+  {
+    "event_id": 0,
+    "n_sites": 3,
+    "quality_pass": false,
+    "lon": -1.9183395169074204,
+    "lat": 50.94074001538769
+  },
+  {
+    "event_id": 1,
+    "n_sites": 3,
+    "quality_pass": false,
+    "lon": -1.9149985716812281,
+    "lat": 50.938948277047494
+  },
+  {
+    "event_id": 2,
+    "n_sites": 4,
+    "quality_pass": false,
+    "lon": -1.938682913039741,
+    "lat": 50.93168421482457
+  },
+  {
+    "event_id": 3,
+    "n_sites": 4,
+    "quality_pass": false,
+    "lon": -1.9134337063246654,
+    "lat": 50.930750053953034
+  },
+  {
+    "event_id": 4,
+    "n_sites": 3,
+    "quality_pass": false,
+    "lon": -1.9177187496493424,
+    "lat": 50.942789727435574
+  },
+  {
+    "event_id": 5,
+    "n_sites": 3,
+    "quality_pass": false,
+    "lon": -1.9117659275198533,
+    "lat": 50.951195956172896
+  },
+  {
+    "event_id": 6,
+    "n_sites": 3,
+    "quality_pass": false,
+    "lon": -1.932294701783458,
+    "lat": 50.93076246912635
+  },
+  {
+    "event_id": 7,
+    "n_sites": 3,
+    "quality_pass": true,
+    "lon": -1.916886345593428,
+    "lat": 50.94117668369121
+  },
+  {
+    "event_id": 8,
+    "n_sites": 3,
+    "quality_pass": false,
+    "lon": -1.9261701610522601,
+    "lat": 50.936532817013706
+  },
+  {
+    "event_id": 9,
+    "n_sites": 3,
+    "quality_pass": true,
+    "lon": -1.9187644754088429,
+    "lat": 50.94148960318201
+  }
+];
     const map = L.map('map', { scrollWheelZoom: true });
 
     const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -3577,7 +3649,8 @@
     osm.addTo(map);
 
     const markers = L.layerGroup();
-        const bearingLines = L.layerGroup();
+    const bearingLines = L.layerGroup();
+    const triangulatedCallMarkers = L.layerGroup();
 
         function destinationPoint(lat, lon, bearingDeg, distanceM) {
             const earthRadiusM = 6378137.0;
@@ -3648,10 +3721,31 @@
         .addTo(markers);
     });
 
+        triangulatedCalls.forEach((call) => {
+            L.circleMarker([call.lat, call.lon], {
+                radius: 6,
+                color: '#0f5132',
+                weight: 2,
+                fillColor: call.quality_pass ? '#2ecc71' : '#f39c12',
+                fillOpacity: 0.95,
+            })
+                .bindPopup(
+                    `<strong>Triangulated call ${call.event_id}</strong><br/>` +
+                    `Sites: ${call.n_sites}<br/>` +
+                    `Quality pass: ${call.quality_pass ? 'yes' : 'no'}<br/>` +
+                    `Lon: ${call.lon.toFixed(6)}<br/>Lat: ${call.lat.toFixed(6)}`
+                )
+                .addTo(triangulatedCallMarkers);
+        });
+
     markers.addTo(map);
         L.control.layers(
             { 'OpenStreetMap': osm, 'Satellite': satellite },
-            { 'Recorder locations': markers, 'Bearing lines': bearingLines },
+            {
+                'Recorder locations': markers,
+                'Bearing lines': bearingLines,
+                'Triangulated calls': triangulatedCallMarkers,
+            },
             { collapsed: false }
         ).addTo(map);
 
