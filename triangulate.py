@@ -4,7 +4,7 @@ This module implements a full end-to-end pipeline:
 1. Read and validate input detections from multiple CSV files.
 2. Parse WGS84 coordinate strings and project to EPSG:27700 (metres).
 3. Collapse near-duplicate recorder placements into canonical site IDs.
-4. Build call events observed by at least 3 unique sites.
+4. Build call events observed by at least 2 unique sites.
 5. Solve call locations using weighted, robust triangulation with bearing
    ambiguity resolution (bearing_1_deg vs bearing_2_deg).
 6. Export canonical sites, event members, and triangulated call coordinates.
@@ -45,10 +45,13 @@ TDOA_THRESHOLD_MS = 0.025
 # The recorders may not be perfectly time-synced, so allow a wider causal
 # coincidence window for same-call matching across sites.
 EVENT_WINDOW_SECONDS = 180.0
-MIN_SITES_PER_EVENT = 3
-MAX_EVENTS_PER_BLOCK = 3
+# Allow 2-site candidates; 2-site solutions are accepted only when branch
+# alternatives collapse to a unique geometric intersection.
+MIN_SITES_PER_EVENT = 2
+MAX_EVENTS_PER_BLOCK = 10
 EVENT_WINDOW_SWEEP_SECONDS = [0.5, 0.75, 1.0, 1.5, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 180.0]
 MAX_PAIR_DELTA_SECONDS = 180.0
+ALLOW_EVENT_ROW_REUSE = True
 
 # Site clustering parameters in metres.
 TARGET_SITE_COUNT = 6
@@ -70,6 +73,7 @@ MAX_ACCEPTABLE_RMS_DEG = 18.0
 MIN_GEOMETRY_SCORE = math.sin(math.radians(10.0))
 MIN_BRANCH_MARGIN = 0.2
 MAX_TRIANGULATION_DISTANCE_M = 1000.0
+TWO_SITE_UNIQUENESS_TOLERANCE_M = 25.0
 
 # Output files.
 SITES_OUTPUT = "triangulation_sites.csv"
@@ -92,7 +96,7 @@ STATIC_MAP_MAX_ZOOM = 18
 STATIC_MAP_MIN_ZOOM = 3
 MAP_BEARING_HALF_LENGTH_DEFAULT_M = 100.0
 MAP_BEARING_HALF_LENGTH_MIN_M = 100.0
-MAP_BEARING_HALF_LENGTH_MAX_M = 750.0
+MAP_BEARING_HALF_LENGTH_MAX_M = 1000.0
 MAP_BEARING_LENGTH_STEP_M = 25.0
 
 OSM_TILE_SOURCE = {
@@ -1067,11 +1071,13 @@ def _match_events_within_block(
     retained = []
     used_row_ids = set()
     for candidate in candidates:
-        row_ids = {int(v) for v in candidate["rows"]["_row_id"].tolist()}
-        if row_ids & used_row_ids:
-            continue
+        if not ALLOW_EVENT_ROW_REUSE:
+            row_ids = {int(v) for v in candidate["rows"]["_row_id"].tolist()}
+            if row_ids & used_row_ids:
+                continue
+            used_row_ids |= row_ids
+
         retained.append(candidate)
-        used_row_ids |= row_ids
         if len(retained) >= max_events:
             break
 
@@ -1515,6 +1521,17 @@ def triangulate_one_event(event_df: pd.DataFrame) -> TriangulationResult | None:
     if not candidates:
         return None
 
+    if len(event_df) == 2:
+        xy = np.array([c["xy"] for c in candidates], dtype=float)
+        max_spread_m = 0.0
+        for i in range(len(xy)):
+            for j in range(i + 1, len(xy)):
+                spread = float(np.sqrt(np.sum((xy[i] - xy[j]) ** 2)))
+                max_spread_m = max(max_spread_m, spread)
+
+        if max_spread_m > TWO_SITE_UNIQUENESS_TOLERANCE_M:
+            return None
+
     candidates.sort(key=lambda x: x["objective"])
     best = candidates[0]
     second = candidates[1] if len(candidates) > 1 else None
@@ -1575,16 +1592,18 @@ def solve_all_events(events_df: pd.DataFrame) -> pd.DataFrame:
         to_wgs84 = Transformer.from_crs("EPSG:27700", "EPSG:4326", always_xy=True)
         lon, lat = to_wgs84.transform(solution.x_m, solution.y_m)
 
+        n_sites = int(group["site_id"].nunique())
         quality_pass = (
             solution.rms_residual_deg <= MAX_ACCEPTABLE_RMS_DEG
             and solution.geometry_score >= MIN_GEOMETRY_SCORE
-            and solution.branch_margin >= MIN_BRANCH_MARGIN
         )
+        if n_sites >= 3:
+            quality_pass = quality_pass and solution.branch_margin >= MIN_BRANCH_MARGIN
 
         rows.append(
             {
                 "event_id": int(event_id),
-                "n_sites": int(group["site_id"].nunique()),
+                "n_sites": n_sites,
                 "event_time_min": group["event_time"].min(),
                 "event_time_max": group["event_time"].max(),
                 "triangulation_success": True,
